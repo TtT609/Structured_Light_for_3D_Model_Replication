@@ -51,3 +51,9 @@ npm run dev
 1. Always git pull before starting work.
 2. Create a feature branch: git checkout -b feature/name-of-feature.
 3. Open a Pull Request on GitHub for review before merging to main.
+
+## Credits & Attribution
+* This project incorporates core 3D scanning algorithms adapted from:
+* Project: Structured Light for 3D Scanning
+* Author: Douglas Lanman (Brown University)
+* Contribution: The Gray code generation and ray-plane triangulation logic in /core/scanner.py is a Python port of the original Matlab implementation by Lanman.
