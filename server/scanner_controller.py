@@ -1,3 +1,5 @@
+# Adapted from Douglas Lanman's "Structured Light for 3D Scanning" (2009)
+
 import numpy as np
 import cv2
 import scipy.io
