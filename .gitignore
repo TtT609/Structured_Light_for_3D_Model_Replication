@@ -7,3 +7,4 @@ ENV/
 # Ignore Python cache files
 __pycache__/
 *.py[cod]
+24_02_2026_3Dscan/

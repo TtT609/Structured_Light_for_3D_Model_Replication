@@ -22,7 +22,7 @@ def remove_outliers_keep_color(file_path, nb_neighbors=20, std_ratio=2.0):
 
     # 3. Save the Cleaned Cloud (WITH original colors)
     # We save *now* before we mess with colors for visualization
-    output_filename = r"C:\Users\Tvang\Downloads\APP_0.2_withoutnode\Finish_Buddha.ply"
+    output_filename = r"C:\TtT\SLproject\Structured_Light_for_3D_Model_Replication\24_02_2026_3Dscan\scans_360\POOP_BIN_30deg_AUTO\POOP_BIN_0deg_scan\POOP_BIN_0deg_scan.ply"
     o3d.io.write_point_cloud(output_filename, inlier_cloud)
     print(f"Saved cleaned cloud with colors to: {output_filename}")
 
@@ -42,7 +42,7 @@ def remove_outliers_keep_color(file_path, nb_neighbors=20, std_ratio=2.0):
 
 if __name__ == "__main__":
     # Replace with your colored .ply file
-    input_file = r"C:\Users\Tvang\Downloads\APP_0.2_withoutnode\Test2.ply"
+    input_file = r"C:\TtT\SLproject\Structured_Light_for_3D_Model_Replication\24_02_2026_3Dscan\scans_360\POOP_BIN_30deg_AUTO\POOP_BIN_0deg_scan\POOP_BIN_0deg_scan.ply"
     remove_outliers_keep_color(input_file,1000,0.01)
 
 """

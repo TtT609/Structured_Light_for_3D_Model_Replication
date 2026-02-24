@@ -445,7 +445,7 @@ class SLSystem:
     # ---------------------------------------------------------
     # 3. CAPTURE SCAN 
     # ---------------------------------------------------------
-    def capture_scan(self, save_dir):
+    def capture_scan(self, save_dir, silent=False):
         # เริ่มต้นตั้งค่าโปรเจกเตอร์ (เช่น เปิดหน้าต่าง Fullscreen)
         self.init_projector()
         P = self.generate_patterns()# สร้างชุดลวดลาย (Gray Code Patterns) ทั้งแนวตั้งและแนวนอนเก็บไว้ในตัวแปร P
@@ -470,16 +470,19 @@ class SLSystem:
         os.makedirs(save_dir, exist_ok=True)
         cv2.imshow(self.window_name, white)
         cv2.waitKey(100)
-        messagebox.showinfo("Step 3", f"Ready to scan.\nImages saved to: {save_dir}")
-        
+        if not silent: 
+            messagebox.showinfo("Step 3", f"Ready to scan.\nImages saved to: {save_dir}")
         for fname, img in patterns:
             cv2.imshow(self.window_name, img)
             cv2.waitKey(200)
             if not self.trigger_capture(os.path.join(save_dir, fname)):
-                messagebox.showerror("Error", "Timeout"); self.close_projector(); return
+                if not silent:
+                    messagebox.showerror("Error", "Timeout"); 
+                self.close_projector(); return
         
         self.close_projector()
-        messagebox.showinfo("Step 3 Done", "Scan Capture Complete.")
+        if not silent:
+            messagebox.showinfo("Step 3 Done", "Scan Capture Complete.")
 
     # ---------------------------------------------------------
     # 4. GENERATE CLOUD (Exact 1:1 Clone of process_cloud.py)
@@ -1445,7 +1448,8 @@ class ScannerGUI:
                 print(f"[Auto] Capturing to {sub_path}")
                 
                 try:
-                    self.sys.capture_scan(sub_path)
+                    # <-- PASS silent=True SO IT SKIPS THE POPUPS!
+                    self.sys.capture_scan(sub_path, silent=True)
                 except Exception as e:
                     print(f"Scan Error: {e}")
                     self.root.after(0, lambda: messagebox.showerror("Error", f"Scan failed: {e}"))
@@ -1464,6 +1468,7 @@ class ScannerGUI:
                         done = self.arduino.wait_for_done(timeout=10) # 10s timeout per move
                         if not done:
                             print("Warning: Arduino move timeout or no DONE received.")
+                        time.sleep(0.5)
                     else:
                         time.sleep(2) # Sim delay
 
