@@ -83,7 +83,7 @@ def remove_outliers_keep_color2(file_path,out, nb_neighbors=20, std_ratio=2.0):
 
     # 1. Apply Statistical Outlier Removal
     print("Removing outliers...")
-    cl, ind = pcd.remove_radius_outlier(nb_points=5, radius=15)
+    cl, ind = pcd.remove_radius_outlier(nb_points=100, radius=5)
 
     # 2. Select the inliers (This preserves original colors)
     inlier_cloud = pcd.select_by_index(ind)
@@ -113,8 +113,8 @@ def remove_outliers_keep_color2(file_path,out, nb_neighbors=20, std_ratio=2.0):
 
 if __name__ == "__main__":
     # Replace with your colored .ply file
-    input_file = r"C:\Users\Tvang\Downloads\APP_0.4\APP_0.4\24_02_2026_3Dscan\Doreamon\Object_360_doraemon_330deg_scan.ply"
-    out = r"C:\Users\Tvang\Downloads\APP_0.4\APP_0.4\24_02_2026_3Dscan\Doreamon - Copy\Object_360_doraemon_330deg_scan.ply"
+    input_file = r"C:\Users\Tvang\Downloads\APP_0.4\APP_0.4\24_02_2026_3Dscan\Bear\Object_360_bear9_90deg_scan.ply"
+    out = r"C:\Users\Tvang\Downloads\APP_0.4\APP_0.4\24_02_2026_3Dscan\Bear - Copy\Object_360_bear9_90deg_scan.ply"
     remove_outliers_keep_color2(input_file,out)
 
 """
