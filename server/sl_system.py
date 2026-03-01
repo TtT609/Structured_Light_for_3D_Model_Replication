@@ -239,6 +239,13 @@ class SLSystem:
                 # Refine corners to sub-pixel resolution
                 corners2 = cv2.cornerSubPix(gray, corners, (11,11), (-1,-1), (cv2.TERM_CRITERIA_EPS+cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001))
                 
+                # Draw chessboard corners and save preview image for user
+                preview_dir = os.path.join(base_dir, "corners_preview")
+                os.makedirs(preview_dir, exist_ok=True)
+                preview_img = img.copy()
+                cv2.drawChessboardCorners(preview_img, (CHECKER_ROWS, CHECKER_COLS), corners2, ret)
+                cv2.imwrite(os.path.join(preview_dir, f"{pose}.png"), preview_img)
+                
                 # Start decoding structured light data
                 files = sorted(glob.glob(os.path.join(path, "*.png")))
                 

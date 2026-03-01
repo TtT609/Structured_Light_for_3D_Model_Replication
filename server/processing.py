@@ -324,9 +324,10 @@ class ProcessingLogic:
         return pcd_down, pcd_fpfh # Return the downsampled model and the feature model
 
     @staticmethod
-    def execute_global_registration(source_down, target_down, source_fpfh, target_fpfh, voxel_size):
+    def execute_global_registration(source_down, target_down, source_fpfh, target_fpfh, voxel_size, icp_dist_ratio=1.5):
         # Function to perform Global Registration (roughly align 2 models facing each other using RANSAC)
-        distance_threshold = voxel_size * 1.5
+        # Set max distance for recognizing matching points dynamically based on voxel_size and the user-defined multiplier
+        distance_threshold = voxel_size * icp_dist_ratio
         
         # Use RANSAC together with FPFH to guess the most matched points
         result = o3d.pipelines.registration.registration_ransac_based_on_feature_matching(
@@ -341,7 +342,7 @@ class ProcessingLogic:
         return result
 
     @staticmethod
-    def merge_pro_360(input_folder, output_path, voxel_size=0.02):
+    def merge_pro_360(input_folder, output_path, voxel_size=0.02, icp_dist_ratio=1.5, outlier_nb=20, outlier_std=2.0):
         # Main function to sequence and merge 3D models obtained from a 360-degree scan (multiple angles) together
         print(f"[Merge 360] Loading clouds from {input_folder}...")
         
@@ -375,8 +376,9 @@ class ProcessingLogic:
             target_down, target_fpfh = ProcessingLogic.preprocess_point_cloud(target, voxel_size)
             
             # 2. Let Open3D try to blindly guess the broad overlapping position first (Global RANSAC)
+            # Pass down the icp_dist_ratio multiplier to control the strictness of the search
             ransac_result = ProcessingLogic.execute_global_registration(
-                source_down, target_down, source_fpfh, target_fpfh, voxel_size)
+                source_down, target_down, source_fpfh, target_fpfh, voxel_size, icp_dist_ratio)
             
             # 3. Let Open3D precisely adjust the overlap from the original distance (Local ICP Refinement Point-to-Plane)
             icp_result = o3d.pipelines.registration.registration_icp(
@@ -399,7 +401,8 @@ class ProcessingLogic:
         pcd_combined_down = merged_cloud.voxel_down_sample(voxel_size=voxel_size)
         
         # Filter out bad points for the final time of merging (Outlier Removal)
-        cl, ind = pcd_combined_down.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+        # using the UI-defined parameters for neighbor count and standard deviation aggressiveness
+        cl, ind = pcd_combined_down.remove_statistical_outlier(nb_neighbors=outlier_nb, std_ratio=outlier_std)
         pcd_final = pcd_combined_down.select_by_index(ind)
         
         # Calculate the latest surface Normals for the large model
@@ -477,7 +480,7 @@ class ProcessingLogic:
         print(f"[Recon] Saved STL to {output_path}")
 
     @staticmethod
-    def mesh_360(input_path, output_path, depth=10, density_trim=0.01, orientation_mode="tangent"):
+    def mesh_360(input_path, output_path, depth=10, density_trim=0.01, orientation_mode="tangent", width=0.0, scale=1.1, linear_fit=False, n_threads=-1, normal_radius=0.1, normal_max_nn=30):
         # Function to create and refine the Mesh specifically for processing models from a 360-degree all-around scan
         if not os.path.exists(input_path):
             raise FileNotFoundError(f"Input file not found: {input_path}")
@@ -489,8 +492,8 @@ class ProcessingLogic:
             raise ValueError("Point cloud is empty.")
             
         # 1. Calculate the initial surface Normal direction for the point cloud
-        print("[360 Mesh] Estimating normals...")
-        pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30))
+        print(f"[360 Mesh] Estimating normals (radius={normal_radius}, max_nn={normal_max_nn})...")
+        pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=normal_radius, max_nn=normal_max_nn))
         
         # 2. Re-adjust the alignment setting of the surface Normal directions to prevent inside-out surface flipping symptoms
         print(f"[360 Mesh] Re-orienting normals (Mode: {orientation_mode})...")
@@ -516,10 +519,11 @@ class ProcessingLogic:
                 pcd.orient_normals_towards_camera_location(center)
                 pcd.normals = o3d.utility.Vector3dVector(np.asarray(pcd.normals) * -1.0)
 
-        # 3. Form the Mesh body to fill the model
-        print(f"[360 Mesh] Poisson Reconstruction (depth={depth})...")
+        # 3. Form the Mesh body to fill the model using Screened Poisson Reconstruction
+        print(f"[360 Mesh] Poisson Reconstruction (depth={depth}, width={width}, scale={scale}, linear={linear_fit}, threads={n_threads})...")
+        # Pass the dynamic UI parameters directly into the Open3D algorithm
         mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
-            pcd, depth=depth, linear_fit=False)
+            pcd, depth=depth, width=width, scale=scale, linear_fit=linear_fit, n_threads=n_threads)
             
         # 4. Trim excess (Optional). If the value is > 0, it will delete the bulging meat lumps that the system blindly generated around hollow areas to a certain extent
         if density_trim > 0.0:

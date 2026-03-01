@@ -3,6 +3,10 @@ import time
 import threading
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog, filedialog
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+import numpy as np
+import scipy.io
 
 from config import DEFAULT_ROOT
 from sl_system import SLSystem
@@ -77,12 +81,27 @@ class ScannerGUI:
         self.merge_output_file = tk.StringVar()
         self.merge_voxel = tk.DoubleVar(value=3) # Downsampling grid resolution
         
+        # Merge 360 Advanced Algorithm Params
+        self.merge_icp_dist = tk.DoubleVar(value=1.5) # ICP match distance multiplier
+        self.merge_outlier_nb = tk.IntVar(value=20)   # Statistical outlier neighbor threshold
+        self.merge_outlier_std = tk.DoubleVar(value=2.0) # Statistical outlier stddev ratio
+        
         # 360 Meshing Params (Surface meshing)
         self.m360_input_ply = tk.StringVar()
         self.m360_output_stl = tk.StringVar()
         self.m360_depth = tk.IntVar(value=10) # Mesh grid calculation depth
         self.m360_trim = tk.DoubleVar(value=0.0) # Trimming level (0.0 = Watertight)
         self.m360_mode = tk.StringVar(value="radial") # Normal orientation mode (Default: Radial)
+        
+        # Advanced Poisson Reconstruct Params
+        self.m360_width = tk.DoubleVar(value=0.0)
+        self.m360_scale = tk.DoubleVar(value=1.1)
+        self.m360_linear_fit = tk.BooleanVar(value=False)
+        self.m360_threads = tk.IntVar(value=-1) # -1 = All cores
+        
+        # Normal Estimation Params
+        self.m360_normal_radius = tk.DoubleVar(value=0.1)
+        self.m360_normal_max_nn = tk.IntVar(value=30)
 
         # STL Reconstruction (Standard 3D modeling parameters)
         self.s_input_ply = tk.StringVar()
@@ -100,6 +119,9 @@ class ScannerGUI:
         self.tt_base_name = tk.StringVar(value="Object_360")
         self.tt_save_dir = tk.StringVar(value=os.path.join(DEFAULT_ROOT, "scans_360"))
 
+        # --- State Variables (Calib Check) ---
+        self.chk_calib_file = tk.StringVar(value=os.path.join(DEFAULT_ROOT, "calib", "calib.mat"))
+
         # --- TABS (Setting up program tab sheets) ---
         self.notebook = ttk.Notebook(root) # Create horizontal tab menu
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
@@ -112,6 +134,7 @@ class ScannerGUI:
         self.tab_mesh360 = ttk.Frame(self.notebook) 
         self.tab_turntable = ttk.Frame(self.notebook) 
         self.tab_recon = ttk.Frame(self.notebook)
+        self.tab_calib_check = ttk.Frame(self.notebook)
         
         
         # Add frames to the menu with headings 1-7
@@ -122,6 +145,7 @@ class ScannerGUI:
         self.notebook.add(self.tab_mesh360, text="5. 360 Meshing")
         self.notebook.add(self.tab_turntable, text="6. Auto-Scan 360")
         self.notebook.add(self.tab_recon, text="7. STL Reconstruction")
+        self.notebook.add(self.tab_calib_check, text="8. Calib Check")
         
         
         # Initialize UI components for each tab
@@ -132,6 +156,7 @@ class ScannerGUI:
         self.setup_360_meshing_tab()
         self.setup_turntable_tab()
         self.setup_stl_tab()
+        self.setup_calib_check_tab()
 
     # ==========================================
     # GUI Layout Functions for Each Tab
@@ -358,17 +383,42 @@ class ScannerGUI:
         lf_param = ttk.LabelFrame(root, text="Parameters")
         lf_param.pack(fill=tk.X, padx=10, pady=5)
         
-        f_vx = ttk.Frame(lf_param); f_vx.pack(fill=tk.X, padx=5, pady=5)
-        ttk.Label(f_vx, text="Voxel Size (m) [Default 0.02]:").pack(side=tk.LEFT)
+        f_vx = ttk.Frame(lf_param); f_vx.pack(fill=tk.X, padx=5, pady=2)
+        ttk.Label(f_vx, text="Voxel Size (mm) [Default 3]:").pack(side=tk.LEFT)
         ttk.Entry(f_vx, textvariable=self.merge_voxel, width=10).pack(side=tk.LEFT, padx=5)
         ttk.Label(f_vx, text="(Size of downsampling grid. Smaller = distincter but slower/noisier. Larger = coarse alignment.)", foreground="#555").pack(side=tk.LEFT)
+
+        f_icp = ttk.Frame(lf_param); f_icp.pack(fill=tk.X, padx=5, pady=2)
+        ttk.Label(f_icp, text="ICP Dist Ratio [Default 1.5]:").pack(side=tk.LEFT)
+        ttk.Entry(f_icp, textvariable=self.merge_icp_dist, width=10).pack(side=tk.LEFT, padx=5)
+        ttk.Label(f_icp, text="(Multiplier for RANSAC alignment search radius. Larger = looser matching.)", foreground="#555").pack(side=tk.LEFT)
+
+        f_onb = ttk.Frame(lf_param); f_onb.pack(fill=tk.X, padx=5, pady=2)
+        ttk.Label(f_onb, text="Outlier Neighbors [Default 20]:").pack(side=tk.LEFT)
+        ttk.Entry(f_onb, textvariable=self.merge_outlier_nb, width=10).pack(side=tk.LEFT, padx=5)
+        ttk.Label(f_onb, text="(How many nearby points needed to not be considered floating dust.)", foreground="#555").pack(side=tk.LEFT)
+
+        f_ost = ttk.Frame(lf_param); f_ost.pack(fill=tk.X, padx=5, pady=2)
+        ttk.Label(f_ost, text="Outlier StdDev [Default 2.0]:").pack(side=tk.LEFT)
+        ttk.Entry(f_ost, textvariable=self.merge_outlier_std, width=10).pack(side=tk.LEFT, padx=5)
+        ttk.Label(f_ost, text="(Aggressiveness of noise trimming. Lower = cuts more edge points.)", foreground="#555").pack(side=tk.LEFT)
 
         ttk.Button(root, text="Merge 360 Point Clouds", command=self.do_merge_360).pack(fill=tk.X, padx=20, pady=20)
 
     def setup_360_meshing_tab(self):
         # Tab 4: Mesh stitching surface coating exclusively for 360 degree 3D models
         root = self.tab_mesh360
-        ttk.Label(root, text="Step 4: 360 Meshing (Poisson + Normal Re-orientation)", font=("Arial", 14, "bold")).pack(pady=10)
+        ttk.Label(root, text="Step 4: 360 Meshing (Poisson + Normal Re-orientation)", font=("Arial", 14, "bold")).pack(pady=5)
+        
+        # Explanation Text Block
+        explanation = (
+            "This tab uses 'Screened Poisson Surface Reconstruction' to wrap a watertight 3D mesh \n"
+            "over your point cloud. Unique to 360 Meshing, it calculates the 'Normal' direction of every \n"
+            "point and attempts to flip them all outwards so that the model doesn't render inside-out.\n"
+            "If you see bubbling artifacts, it means the Normal vectors were calculated incorrectly. \n"
+            "Adjusting the Normal Estimation Search Radius can help fix these bubbles."
+        )
+        ttk.Label(root, text=explanation, justify=tk.CENTER, foreground="#333", font=("Arial", 9, "italic")).pack(pady=(0, 10))
         
         lf_files = ttk.LabelFrame(root, text="Files")
         lf_files.pack(fill=tk.X, padx=10, pady=5)
@@ -385,20 +435,49 @@ class ScannerGUI:
         lf_param.pack(fill=tk.X, padx=10, pady=5)
         
         # Select mesh stitching direction (Radial, Tangent)
-        f_m = ttk.Frame(lf_param); f_m.pack(fill=tk.X, padx=5, pady=5)
+        f_m = ttk.Frame(lf_param); f_m.pack(fill=tk.X, padx=5, pady=2)
         ttk.Label(f_m, text="Orientation Mode:").pack(side=tk.LEFT)
         # Dropdown Combobox for user selection
         ttk.Combobox(f_m, textvariable=self.m360_mode, values=["radial", "tangent"], state="readonly", width=10).pack(side=tk.LEFT, padx=5)
         ttk.Label(f_m, text="(Radial = Outwards from center | Tangent = Graph consistency)", foreground="#555").pack(side=tk.LEFT)
 
-        f_d = ttk.Frame(lf_param); f_d.pack(fill=tk.X, padx=5, pady=5)
-        ttk.Label(f_d, text="Poisson Depth (Default 10):").pack(side=tk.LEFT)
+        f_nr = ttk.Frame(lf_param); f_nr.pack(fill=tk.X, padx=5, pady=2)
+        ttk.Label(f_nr, text="Normal Search Radius [Default 0.1]:").pack(side=tk.LEFT)
+        ttk.Entry(f_nr, textvariable=self.m360_normal_radius, width=10).pack(side=tk.LEFT, padx=5)
+        ttk.Label(f_nr, text="(Increase if you see bubbles/inverted surfaces)", foreground="#555").pack(side=tk.LEFT)
+
+        f_nn = ttk.Frame(lf_param); f_nn.pack(fill=tk.X, padx=5, pady=2)
+        ttk.Label(f_nn, text="Normal Max Neighbors [Default 30]:").pack(side=tk.LEFT)
+        ttk.Entry(f_nn, textvariable=self.m360_normal_max_nn, width=10).pack(side=tk.LEFT, padx=5)
+
+        f_d = ttk.Frame(lf_param); f_d.pack(fill=tk.X, padx=5, pady=2)
+        ttk.Label(f_d, text="Poisson Depth [Default 10]:").pack(side=tk.LEFT)
         ttk.Entry(f_d, textvariable=self.m360_depth, width=10).pack(side=tk.LEFT, padx=5)
+        ttk.Label(f_d, text="(Max octree depth. Higher = more detail but slower. >12 may freeze PC.)", foreground="#555").pack(side=tk.LEFT)
         
-        f_t = ttk.Frame(lf_param); f_t.pack(fill=tk.X, padx=5, pady=5)
-        ttk.Label(f_t, text="Density Trim (0.0 = Watertight):").pack(side=tk.LEFT)
+        f_w = ttk.Frame(lf_param); f_w.pack(fill=tk.X, padx=5, pady=2)
+        ttk.Label(f_w, text="Target Width [Default 0.0]:").pack(side=tk.LEFT)
+        ttk.Entry(f_w, textvariable=self.m360_width, width=10).pack(side=tk.LEFT, padx=5)
+        ttk.Label(f_w, text="(Finest level octree cell size. Leave 0.0 to rely on Depth instead.)", foreground="#555").pack(side=tk.LEFT)
+        
+        f_s = ttk.Frame(lf_param); f_s.pack(fill=tk.X, padx=5, pady=2)
+        ttk.Label(f_s, text="Scale Ratio [Default 1.1]:").pack(side=tk.LEFT)
+        ttk.Entry(f_s, textvariable=self.m360_scale, width=10).pack(side=tk.LEFT, padx=5)
+        ttk.Label(f_s, text="(Ratio of reconstruction bounding box to sample bounding box.)", foreground="#555").pack(side=tk.LEFT)
+
+        f_lf = ttk.Frame(lf_param); f_lf.pack(fill=tk.X, padx=5, pady=2)
+        ttk.Checkbutton(f_lf, text="Linear Fit Interpolation", variable=self.m360_linear_fit).pack(side=tk.LEFT)
+        ttk.Label(f_lf, text="(Toggle on to use linear fitting instead of default cubic interpolation.)", foreground="#555").pack(side=tk.LEFT)
+
+        f_th = ttk.Frame(lf_param); f_th.pack(fill=tk.X, padx=5, pady=2)
+        ttk.Label(f_th, text="Number Threads [Default -1]:").pack(side=tk.LEFT)
+        ttk.Entry(f_th, textvariable=self.m360_threads, width=10).pack(side=tk.LEFT, padx=5)
+        ttk.Label(f_th, text="(-1 = Auto/All CPU Cores)", foreground="#555").pack(side=tk.LEFT)
+
+        f_t = ttk.Frame(lf_param); f_t.pack(fill=tk.X, padx=5, pady=2)
+        ttk.Label(f_t, text="Density Trim [0.0 = Watertight]:").pack(side=tk.LEFT)
         ttk.Entry(f_t, textvariable=self.m360_trim, width=10).pack(side=tk.LEFT, padx=5)
-        ttk.Label(f_t, text="(0.0 fills EVERYTHING. >0.0 cuts bubbles)", foreground="#555").pack(side=tk.LEFT)
+        ttk.Label(f_t, text="(>0.0 trims external overlapping bubbles)", foreground="#555").pack(side=tk.LEFT)
         
         ttk.Button(root, text="Run 360 Meshing", command=self.do_360_meshing).pack(fill=tk.X, padx=20, pady=20)
 
@@ -485,6 +564,20 @@ class ScannerGUI:
         
         ttk.Button(root, text="Run STL Reconstruction", command=self.do_stl_recon).pack(fill=tk.X, padx=20, pady=20)
 
+    def setup_calib_check_tab(self):
+        # Tab 8: Visualize Calibration 3D space
+        root = self.tab_calib_check
+        ttk.Label(root, text="Step 8: Calib Check (3D Visualization)", font=("Arial", 14, "bold")).pack(pady=10)
+        
+        lf_files = ttk.LabelFrame(root, text="1. Calibration File (.mat)")
+        lf_files.pack(fill=tk.X, padx=10, pady=5)
+        
+        f_in = ttk.Frame(lf_files)
+        f_in.pack(fill=tk.X, padx=5, pady=5)
+        ttk.Button(f_in, text="Browse .mat", command=lambda: self.sel_file_load(self.chk_calib_file, "MAT")).pack(side=tk.LEFT)
+        ttk.Entry(f_in, textvariable=self.chk_calib_file).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        
+        ttk.Button(root, text="Show 3D Visualization", command=self.do_show_calib_3d).pack(fill=tk.X, padx=20, pady=20)
 
     # ==========================================
     # Button command functions section (Actions and Helper Actions)
@@ -843,24 +936,44 @@ class ScannerGUI:
 
     def do_360_meshing(self):
         # Run Tab 4 Normal Mesh 
-        i = self.m360_input_ply.get()
-        o = self.m360_output_stl.get()
-        d = self.m360_depth.get()
-        t = self.m360_trim.get()
-        m = self.m360_mode.get()
+        in_file = self.m360_input_ply.get()
+        out_file = self.m360_output_stl.get()
+        mode = self.m360_mode.get()
+        depth = self.m360_depth.get()
+        trim = self.m360_trim.get()
         
-        if not i or not o: messagebox.showerror("Error", "Select files first."); return
+        # Retrieve the advanced Poisson settings from UI
+        p_width = self.m360_width.get()
+        p_scale = self.m360_scale.get()
+        p_linear = self.m360_linear_fit.get()
+        p_threads = self.m360_threads.get()
         
-        def run():
+        # Retrieve Normal Estimation parameters
+        n_rad = self.m360_normal_radius.get()
+        n_max = self.m360_normal_max_nn.get()
+        
+        if not os.path.isfile(in_file):
+            messagebox.showerror("Error", "Input .PLY not found.")
+            return
+            
+        def run_thread():
             try:
-                self.processor.mesh_360(i, o, d, t, m)
-                self.root.after(0, lambda: messagebox.showinfo("Done", f"360 Mesh Saved to:\n{o}"))
+                self.sys_log(f"Starting 360 Meshing (Poisson):\nDepth: {depth}, Trim: {trim}, Mode: {mode}, Threads: {p_threads}\nNormals (Rad: {n_rad}, MaxNN: {n_max})")
+                self.processor.mesh_360(
+                    input_path=in_file, output_path=out_file, 
+                    depth=depth, density_trim=trim, orientation_mode=mode,
+                    width=p_width, scale=p_scale, linear_fit=p_linear, n_threads=p_threads,
+                    normal_radius=n_rad, normal_max_nn=n_max
+                )
+                self.sys_log("360 Meshing complete.")
+                self.root.after(0, lambda: messagebox.showinfo("Done", f"360 Mesh Saved to:\n{out_file}"))
             except Exception as e:
                 err_msg = str(e)
                 print(f"Error: {e}")
+                self.root.after(0, lambda: messagebox.showerror("Error", err_msg))
                 # Don't popup error if thread dying... print is safer.
         
-        threading.Thread(target=run, daemon=True).start()
+        threading.Thread(target=run_thread, daemon=True).start()
 
     def do_stl_recon(self):
         # Run Tab 6 basic operations
@@ -973,3 +1086,132 @@ class ScannerGUI:
 
         threading.Thread(target=run_thread, daemon=True).start()
 
+    def do_show_calib_3d(self):
+        calib_file = self.chk_calib_file.get()
+        if not os.path.exists(calib_file):
+            messagebox.showerror("Error", f"Calibration file not found at: {calib_file}")
+            return
+            
+        try:
+            from scipy.spatial.transform import Rotation as R_sci
+            
+            data = scipy.io.loadmat(calib_file)
+            if 'R' not in data or 'T' not in data:
+                messagebox.showerror("Error", "Selected file doesn't contain complete Stereo Calibration matrices (R and T flags).")
+                return
+                
+            R = data['R']
+            T = data['T']
+            
+            # Camera origin is [0, 0, 0]
+            cam_center = np.zeros(3)
+            
+            # Projector origin from geometric stereo transformation
+            R_inv = R.T
+            proj_center = (-R_inv @ T).flatten()
+            
+            # Calculate metrics for display
+            dx, dy, dz = proj_center[0], proj_center[1], proj_center[2]
+            distance = np.linalg.norm(proj_center)
+            
+            # Convert Rotation matrix to Euler angles (degrees)
+            # 'xyz' means rotation around x, then y, then z.
+            rot = R_sci.from_matrix(R_inv)
+            euler_angles = rot.as_euler('xyz', degrees=True)
+            rx, ry, rz = euler_angles[0], euler_angles[1], euler_angles[2]
+            
+            # Define axis lines for visualization
+            axis_length = max(distance * 0.5, 50.0) # Base length on distance or a minimum
+            
+            # Camera axes
+            cam_x = np.array([axis_length, 0, 0])
+            cam_y = np.array([0, axis_length, 0])
+            cam_z = np.array([0, 0, axis_length])
+            
+            # Projector axes (rotated by R_inv)
+            proj_x = R_inv @ np.array([[axis_length], [0], [0]])
+            proj_x = proj_center + proj_x.flatten()
+            
+            proj_y = R_inv @ np.array([[0], [axis_length], [0]])
+            proj_y = proj_center + proj_y.flatten()
+            
+            proj_z = R_inv @ np.array([[0], [0], [axis_length]])
+            proj_z = proj_center + proj_z.flatten()
+            
+            # Initialize Matplotlib Figure
+            fig = plt.figure(figsize=(12, 7)) # Wider figure to fit side text
+            
+            # Create a 3D subplot that takes up the left side
+            ax = fig.add_axes([0.05, 0.1, 0.6, 0.8], projection='3d')
+            
+            # Plot connection line
+            ax.plot([cam_center[0], proj_center[0]], 
+                    [cam_center[1], proj_center[1]], 
+                    [cam_center[2], proj_center[2]], 'k--', label=f'Baseline ({distance:.1f}mm)')
+                    
+            # Plot Camera
+            ax.scatter(*cam_center, c='b', marker='s', s=100, label='Camera (Origin)')
+            ax.text(*cam_center, "  Camera", color='blue')
+            ax.plot([cam_center[0], cam_x[0]], [cam_center[1], cam_x[1]], [cam_center[2], cam_x[2]], 'r-')
+            ax.plot([cam_center[0], cam_y[0]], [cam_center[1], cam_y[1]], [cam_center[2], cam_y[2]], 'g-')
+            ax.plot([cam_center[0], cam_z[0]], [cam_center[1], cam_z[1]], [cam_center[2], cam_z[2]], 'b-')
+            
+            # Plot Projector
+            ax.scatter(*proj_center, c='r', marker='o', s=100, label='Projector')
+            ax.text(*proj_center, "  Projector", color='red')
+            ax.plot([proj_center[0], proj_x[0]], [proj_center[1], proj_x[1]], [proj_center[2], proj_x[2]], 'r-')
+            ax.plot([proj_center[0], proj_y[0]], [proj_center[1], proj_y[1]], [proj_center[2], proj_y[2]], 'g-')
+            ax.plot([proj_center[0], proj_z[0]], [proj_center[1], proj_z[1]], [proj_center[2], proj_z[2]], 'b-')
+            
+            # Equalize aspect ratio logic roughly for generic matplotlib 3D plots
+            all_pts = np.vstack([cam_center, proj_center, cam_x, cam_y, cam_z, proj_x, proj_y, proj_z])
+            max_range = np.array([all_pts[:,0].max()-all_pts[:,0].min(), 
+                                  all_pts[:,1].max()-all_pts[:,1].min(), 
+                                  all_pts[:,2].max()-all_pts[:,2].min()]).max() / 2.0
+            
+            # Find bounds
+            mid_x = (all_pts[:,0].max()+all_pts[:,0].min()) * 0.5
+            mid_y = (all_pts[:,1].max()+all_pts[:,1].min()) * 0.5
+            mid_z = (all_pts[:,2].max()+all_pts[:,2].min()) * 0.5
+            
+            ax.set_xlim(mid_x - max_range, mid_x + max_range)
+            ax.set_ylim(mid_y - max_range, mid_y + max_range)
+            ax.set_zlim(mid_z - max_range, mid_z + max_range)
+            
+            ax.set_xlabel('X axis (mm)')
+            ax.set_ylabel('Y axis (mm)')
+            ax.set_zlabel('Z axis (mm)')
+            ax.set_title("Stereo Calibration Spatial Graph")
+            ax.legend()
+            
+            # Add explanatory text on the right side of the figure
+            info_text = (
+                "--- 3D System Properties ---\n\n"
+                "Axis Meanings:\n"
+                "• Red Line (X-Axis): Horizontal width (Left/Right)\n"
+                "• Green Line (Y-Axis): Vertical height (Up/Down)\n"
+                "• Blue Line (Z-Axis): Depth (Forward/Backward)\n\n"
+                "The Camera is the Origin [0, 0, 0].\n"
+                "All coordinates are relative to the Camera lens.\n\n"
+                "--- Projector Position (Translation) ---\n"
+                f"Absolute Distance:\n  {distance:.2f} mm\n\n"
+                f"Offset from Camera (XYZ):\n"
+                f"• X offset: {dx:+.2f} mm\n"
+                f"• Y offset: {dy:+.2f} mm\n"
+                f"• Z offset: {dz:+.2f} mm\n\n"
+                "--- Projector Angle (Rotation) ---\n"
+                f"Euler Angles (XYZ):\n"
+                f"• Pitch (X-rotation): {rx:+.2f}°\n"
+                f"• Yaw   (Y-rotation): {ry:+.2f}°\n"
+                f"• Roll  (Z-rotation): {rz:+.2f}°\n"
+            )
+            
+            fig.text(0.70, 0.5, info_text, fontsize=11, family='monospace',
+                     va='center', ha='left', bbox=dict(facecolor='white', alpha=0.8, edgecolor='gray', boxstyle='round,pad=1'))
+
+            plt.show()
+            
+        except ImportError:
+            messagebox.showerror("Graph Error", "Package 'scipy' is required for Euler angle conversion. Ensure it is fully installed.")
+        except Exception as e:
+            messagebox.showerror("Graph Build Error", str(e))
