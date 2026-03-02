@@ -342,7 +342,7 @@ class ProcessingLogic:
         return result
 
     @staticmethod
-    def merge_pro_360(input_folder, output_path, voxel_size=0.02, icp_dist_ratio=1.5, outlier_nb=20, outlier_std=2.0):
+    def merge_pro_360(input_folder, output_path, voxel_size=0.02, icp_dist_ratio=1.5, outlier_nb=20, outlier_std=2.0, sample_before=1, sample_after=1, final_voxel=0.5):
         # Main function to sequence and merge 3D models obtained from a 360-degree scan (multiple angles) together
         print(f"[Merge 360] Loading clouds from {input_folder}...")
         
@@ -355,6 +355,9 @@ class ProcessingLogic:
         for path in ply_files:
             # Load each model file into a loop to store as a List (pcds)
             pcd = o3d.io.read_point_cloud(path)
+            # Apply initial sampling if requested
+            if sample_before > 1:
+                pcd = pcd.uniform_down_sample(every_k_points=int(sample_before))
             pcds.append(pcd)
             
         print(f"[Merge 360] Loaded {len(pcds)} clouds. Running Sequential Registration (New360 Logic)...")
@@ -396,9 +399,15 @@ class ProcessingLogic:
             pcd_temp.transform(max_accum_T) # Change the position of the latest model and overlap it
             merged_cloud += pcd_temp        # Combine together
             
-        print("[Merge 360] Post-processing (Downsample + Outlier removal)...")
-        # Take the entire large finished model and reduce its resolution one last time to prevent the computer from lagging
-        pcd_combined_down = merged_cloud.voxel_down_sample(voxel_size=voxel_size)
+        print(f"[Merge 360] Post-processing (Final Voxel: {final_voxel}, Outlier removal)...")
+        # Take the entire large finished model and reduce its resolution one last time to prevent the computer from lagging (optional if user set Final Voxel to >0)
+        pcd_combined_down = merged_cloud
+        if final_voxel > 0:
+            pcd_combined_down = merged_cloud.voxel_down_sample(voxel_size=final_voxel)
+        
+        # Apply after merge sampling if requested
+        if sample_after > 1:
+            pcd_combined_down = pcd_combined_down.uniform_down_sample(every_k_points=int(sample_after))
         
         # Filter out bad points for the final time of merging (Outlier Removal)
         # using the UI-defined parameters for neighbor count and standard deviation aggressiveness

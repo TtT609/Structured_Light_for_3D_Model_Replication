@@ -85,6 +85,9 @@ class ScannerGUI:
         self.merge_icp_dist = tk.DoubleVar(value=1.5) # ICP match distance multiplier
         self.merge_outlier_nb = tk.IntVar(value=20)   # Statistical outlier neighbor threshold
         self.merge_outlier_std = tk.DoubleVar(value=2.0) # Statistical outlier stddev ratio
+        self.merge_sample_before = tk.IntVar(value=1) # Uniform down-sample before merge
+        self.merge_sample_after = tk.IntVar(value=1)  # Uniform down-sample after merge
+        self.merge_final_voxel = tk.DoubleVar(value=0.5) # Final overlapping point reduction
         
         # 360 Meshing Params (Surface meshing)
         self.m360_input_ply = tk.StringVar()
@@ -402,6 +405,21 @@ class ScannerGUI:
         ttk.Label(f_ost, text="Outlier StdDev [Default 2.0]:").pack(side=tk.LEFT)
         ttk.Entry(f_ost, textvariable=self.merge_outlier_std, width=10).pack(side=tk.LEFT, padx=5)
         ttk.Label(f_ost, text="(Aggressiveness of noise trimming. Lower = cuts more edge points.)", foreground="#555").pack(side=tk.LEFT)
+
+        f_sb = ttk.Frame(lf_param); f_sb.pack(fill=tk.X, padx=5, pady=2)
+        ttk.Label(f_sb, text="Sampling Number Before [Default 1]:").pack(side=tk.LEFT)
+        ttk.Entry(f_sb, textvariable=self.merge_sample_before, width=10).pack(side=tk.LEFT, padx=5)
+        ttk.Label(f_sb, text="(1 = All pts, 2 = Keep 1/2. Reduces points before matching)", foreground="#555").pack(side=tk.LEFT)
+
+        f_sa = ttk.Frame(lf_param); f_sa.pack(fill=tk.X, padx=5, pady=2)
+        ttk.Label(f_sa, text="Sampling Number After [Default 1]:").pack(side=tk.LEFT)
+        ttk.Entry(f_sa, textvariable=self.merge_sample_after, width=10).pack(side=tk.LEFT, padx=5)
+        ttk.Label(f_sa, text="(1 = All pts, 2 = Keep 1/2. Reduces final merged points)", foreground="#555").pack(side=tk.LEFT)
+
+        f_fvx = ttk.Frame(lf_param); f_fvx.pack(fill=tk.X, padx=5, pady=2)
+        ttk.Label(f_fvx, text="Final Voxel Size (mm) [0 = Disable]:").pack(side=tk.LEFT)
+        ttk.Entry(f_fvx, textvariable=self.merge_final_voxel, width=10).pack(side=tk.LEFT, padx=5)
+        ttk.Label(f_fvx, text="(Merges overlapping points perfectly. Default 0.5. Set 0 to keep true 100% cloud)", foreground="#555").pack(side=tk.LEFT)
 
         ttk.Button(root, text="Merge 360 Point Clouds", command=self.do_merge_360).pack(fill=tk.X, padx=20, pady=20)
 
@@ -917,7 +935,15 @@ class ScannerGUI:
 
     def do_merge_360(self):
         # Run Tab 3 merge 360 model
+        in_dir = self.merge_input_dir.get()
+        out_file = self.merge_output_file.get()
         vx = self.merge_voxel.get()
+        icp_dist = self.merge_icp_dist.get()
+        outlier_nb = self.merge_outlier_nb.get()
+        outlier_std = self.merge_outlier_std.get()
+        sample_before = self.merge_sample_before.get()
+        sample_after = self.merge_sample_after.get()
+        final_voxel = self.merge_final_voxel.get()
         
         if not in_dir or not out_file:
             messagebox.showerror("Error", "Select Input Folder and Output File.")
@@ -925,7 +951,7 @@ class ScannerGUI:
 
         def run():
             try:
-                self.processor.merge_pro_360(in_dir, out_file, vx)
+                self.processor.merge_pro_360(in_dir, out_file, vx, icp_dist, outlier_nb, outlier_std, sample_before, sample_after, final_voxel)
                 self.root.after(0, lambda: messagebox.showinfo("Merge Done", f"Saved merged cloud to:\n{out_file}"))
             except Exception as e:
                  err_msg = str(e)
