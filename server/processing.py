@@ -346,8 +346,32 @@ class ProcessingLogic:
         # Main function to sequence and merge 3D models obtained from a 360-degree scan (multiple angles) together
         print(f"[Merge 360] Loading clouds from {input_folder}...")
         
-        # Find all .ply files in the folder and sort by name
-        ply_files = sorted(glob.glob(os.path.join(input_folder, "*.ply")))
+        # Find all .ply files in the folder
+        ply_files = glob.glob(os.path.join(input_folder, "*.ply"))
+        
+        # Sort files based on the degree number in the filename (e.g., 'doraemon_30deg_scan.ply' -> 30)
+        def extract_degree(filepath):
+            filename = os.path.basename(filepath)
+            try:
+                # Assuming format like "name_numberdeg_scan.ply" or similar containing "deg"
+                # Find the part containing "deg"
+                parts = filename.split('_')
+                for part in parts:
+                    if 'deg' in part:
+                        # Strip "deg" and convert to integer
+                        num_str = part.replace('deg', '')
+                        return int(num_str)
+                # Fallback if "deg" not found, try to find any number
+                import re
+                numbers = re.findall(r'\d+', filename)
+                if numbers:
+                    return int(numbers[-1])
+            except:
+                pass
+            return 0 # Default if parsing fails
+
+        ply_files = sorted(ply_files, key=extract_degree)
+        
         if len(ply_files) < 2:
             raise ValueError("Need at least 2 .ply files to merge.") # Must have at least 2 models to be able to merge
             

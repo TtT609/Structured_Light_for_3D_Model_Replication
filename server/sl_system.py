@@ -413,6 +413,7 @@ class SLSystem:
         scipy.io.savemat(output_file, {
             "Nc": Nc,             # Rays of the mobile camera sensor
             "Oc": Oc,             # Camera coordinates
+            "dc": D1,
             "wPlaneCol": wPlaneCol.T,  # Vertical screen lines
             "wPlaneRow": wPlaneRow.T,  # Horizontal screen lines
             "cam_K": K1,          # Camera lens Intrinsic 
