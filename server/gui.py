@@ -264,7 +264,37 @@ class ScannerGUI:
 
     def setup_processing_tab(self):
         # Tab 2: Clear noise, remove background walls
-        root = self.tab_proc
+        main_frame = self.tab_proc
+        
+        canvas = tk.Canvas(main_frame, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(main_frame, orient="vertical", command=canvas.yview)
+        
+        root = ttk.Frame(canvas)
+        
+        root.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        
+        frame_id = canvas.create_window((0, 0), window=root, anchor="nw")
+        
+        def on_canvas_configure(e):
+            canvas.itemconfig(frame_id, width=e.width)
+            
+        canvas.bind("<Configure>", on_canvas_configure)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        
+        def _on_mousewheel(event):
+            try:
+                if self.notebook.select() == str(self.tab_proc):
+                    canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+            except Exception:
+                pass
+                
+        canvas.bind_all("<MouseWheel>", _on_mousewheel, add="+")
         ttk.Label(root, text="Step 2: Cleanup & Process (Batch)", font=("Arial", 14, "bold")).pack(pady=10)
         ttk.Label(root, text="Pipeline: Load -> Remove Background -> Remove Outliers -> Save", foreground="blue").pack()
 
