@@ -49,9 +49,14 @@ class ScannerGUI:
         self.mpcp_mode = tk.StringVar(value="single") # 'single' or 'batch'
         
         # --- State Variables (Combined Processing - Tab 3) ---
-        # Unified Processing menu
-        self.proc_input_dir = tk.StringVar()  # Input folder
-        self.proc_output_dir = tk.StringVar() # Output folder
+        # Toggle: process a single file or an entire folder batch
+        self.proc_mode = tk.StringVar(value="folder") # 'file' or 'folder'
+        # Single-file mode paths
+        self.proc_input_file = tk.StringVar()   # Single input .ply file path
+        self.proc_output_file = tk.StringVar()  # Single output .ply file path
+        # Folder-batch mode paths (original behaviour)
+        self.proc_input_dir = tk.StringVar()   # Input folder (all .ply inside)
+        self.proc_output_dir = tk.StringVar()  # Output folder
         
         # Checkboxes for toggling specific cleaning algorithms
         self.enable_bg_removal = tk.BooleanVar(value=True) # Enable/Disable background wall removal variable
@@ -88,6 +93,8 @@ class ScannerGUI:
         self.merge_sample_before = tk.IntVar(value=1) # Uniform down-sample before merge
         self.merge_sample_after = tk.IntVar(value=1)  # Uniform down-sample after merge
         self.merge_final_voxel = tk.DoubleVar(value=0.5) # Final overlapping point reduction
+        # Checkbox: toggle step-by-step 3D preview popup (blocks merge between steps until window closed)
+        self.merge_show_preview = tk.BooleanVar(value=False)
         
         # 360 Meshing Params (Surface meshing)
         self.m360_input_ply = tk.StringVar()
@@ -105,6 +112,9 @@ class ScannerGUI:
         # Normal Estimation Params
         self.m360_normal_radius = tk.DoubleVar(value=0.1)
         self.m360_normal_max_nn = tk.IntVar(value=30)
+        # Save normals point cloud: checkbox + output path
+        self.m360_save_normals = tk.BooleanVar(value=False)          # Enable/disable saving the normal-enriched PLY
+        self.m360_normals_out = tk.StringVar()                        # Path to save the normals PLY
 
         # STL Reconstruction (Standard 3D modeling parameters)
         self.s_input_ply = tk.StringVar()
@@ -112,6 +122,23 @@ class ScannerGUI:
         self.s_mode = tk.StringVar(value="watertight")
         self.s_depth = tk.IntVar(value=10)
         self.s_radii = tk.StringVar(value="1, 2, 4")
+        # Centroid-based normal orientation (orients all normals to face outward from cloud center)
+        self.s_centroid_orient = tk.BooleanVar(value=True)
+        # Consistency pass: run orient_normals_consistent_tangent_plane(k) AFTER centroid orient
+        # to propagate the outward direction through the neighborhood graph, fixing stray normals
+        self.s_consistency_pass = tk.BooleanVar(value=False)   # Enable/disable consistency pass
+        self.s_consistency_k = tk.IntVar(value=30)             # Number of neighbors for the pass
+        # MeshLab post-processing via pymeshlab
+        self.s_use_meshlab = tk.BooleanVar(value=False)
+        self.s_ml_smooth_type = tk.StringVar(value="taubin")   # 'taubin' or 'laplacian'
+        self.s_ml_smooth_iters = tk.IntVar(value=10)           # Number of smoothing iterations
+        self.s_ml_close_holes = tk.BooleanVar(value=False)     # Fill small holes in mesh
+        self.s_ml_close_max_size = tk.IntVar(value=30)         # Max hole size (edges) to close
+        self.s_ml_simplify = tk.BooleanVar(value=False)        # Reduce polygon count
+        self.s_ml_target_faces = tk.IntVar(value=50000)        # Target face count after simplification
+        # Save normals point cloud (same feature as in 360 Meshing tab)
+        self.s_save_normals = tk.BooleanVar(value=False)        # Enable/disable saving the normals PLY
+        self.s_normals_out = tk.StringVar()                     # Path for the normals output PLY
 
         # --- State Variables (Turntable) ---
         self.tt_port = tk.StringVar() # COM Port selection
@@ -295,21 +322,45 @@ class ScannerGUI:
                 pass
                 
         canvas.bind_all("<MouseWheel>", _on_mousewheel, add="+")
-        ttk.Label(root, text="Step 2: Cleanup & Process (Batch)", font=("Arial", 14, "bold")).pack(pady=10)
+        ttk.Label(root, text="Step 2: Cleanup & Process", font=("Arial", 14, "bold")).pack(pady=10)
         ttk.Label(root, text="Pipeline: Load -> Remove Background -> Remove Outliers -> Save", foreground="blue").pack()
 
-        # Frame for all source files (Allows multi-file loading - Batch process)
-        lf_files = ttk.LabelFrame(root, text="Files")
-        lf_files.pack(fill=tk.X, padx=10, pady=5)
-        
-        # Source folder
-        f_in = ttk.Frame(lf_files); f_in.pack(fill=tk.X, padx=5, pady=5)
-        ttk.Button(f_in, text="Select Input Folder", command=lambda: self.sel_dir(self.proc_input_dir)).pack(side=tk.LEFT)
+        # ── Mode selector (Single File vs Folder Batch) ──────────────────────────
+        lf_mode = ttk.LabelFrame(root, text="Input / Output Mode")
+        lf_mode.pack(fill=tk.X, padx=10, pady=5)
+
+        f_radio = ttk.Frame(lf_mode); f_radio.pack(fill=tk.X, padx=5, pady=5)
+        ttk.Radiobutton(f_radio, text="Single File  (one .ply in → one .ply out)",
+                        variable=self.proc_mode, value="file").pack(side=tk.LEFT, padx=10)
+        ttk.Radiobutton(f_radio, text="Folder Batch (all .ply in folder → output folder)",
+                        variable=self.proc_mode, value="folder").pack(side=tk.LEFT, padx=10)
+
+        # ── Single-file rows ─────────────────────────────────────────────────────
+        lf_single = ttk.LabelFrame(root, text="Single File")
+        lf_single.pack(fill=tk.X, padx=10, pady=2)
+
+        f_sf_in = ttk.Frame(lf_single); f_sf_in.pack(fill=tk.X, padx=5, pady=4)
+        ttk.Button(f_sf_in, text="Select Input .PLY",
+                   command=lambda: self.sel_file_load(self.proc_input_file, "PLY")).pack(side=tk.LEFT)
+        ttk.Entry(f_sf_in, textvariable=self.proc_input_file).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+
+        f_sf_out = ttk.Frame(lf_single); f_sf_out.pack(fill=tk.X, padx=5, pady=4)
+        ttk.Button(f_sf_out, text="Select Output .PLY",
+                   command=lambda: self.sel_file_save(self.proc_output_file, "PLY")).pack(side=tk.LEFT)
+        ttk.Entry(f_sf_out, textvariable=self.proc_output_file).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+
+        # ── Folder-batch rows ────────────────────────────────────────────────────
+        lf_batch = ttk.LabelFrame(root, text="Folder Batch")
+        lf_batch.pack(fill=tk.X, padx=10, pady=2)
+
+        f_in = ttk.Frame(lf_batch); f_in.pack(fill=tk.X, padx=5, pady=4)
+        ttk.Button(f_in, text="Select Input Folder",
+                   command=lambda: self.sel_dir(self.proc_input_dir)).pack(side=tk.LEFT)
         ttk.Entry(f_in, textvariable=self.proc_input_dir).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
-        
-        # Destination folder
-        f_out = ttk.Frame(lf_files); f_out.pack(fill=tk.X, padx=5, pady=5)
-        ttk.Button(f_out, text="Select Output Folder", command=lambda: self.sel_dir(self.proc_output_dir)).pack(side=tk.LEFT)
+
+        f_out = ttk.Frame(lf_batch); f_out.pack(fill=tk.X, padx=5, pady=4)
+        ttk.Button(f_out, text="Select Output Folder",
+                   command=lambda: self.sel_dir(self.proc_output_dir)).pack(side=tk.LEFT)
         ttk.Entry(f_out, textvariable=self.proc_output_dir).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
 
         # 1. Background Remove parameters
@@ -451,6 +502,24 @@ class ScannerGUI:
         ttk.Entry(f_fvx, textvariable=self.merge_final_voxel, width=10).pack(side=tk.LEFT, padx=5)
         ttk.Label(f_fvx, text="(Merges overlapping points perfectly. Default 0.5. Set 0 to keep true 100% cloud)", foreground="#555").pack(side=tk.LEFT)
 
+        # --- Step Preview Checkbox ---
+        lf_preview = ttk.LabelFrame(root, text="Step-by-Step 3D Preview")
+        lf_preview.pack(fill=tk.X, padx=10, pady=5)
+        
+        f_prev = ttk.Frame(lf_preview); f_prev.pack(fill=tk.X, padx=5, pady=5)
+        ttk.Checkbutton(
+            f_prev,
+            text="Show 3D model preview after each merge step",
+            variable=self.merge_show_preview
+        ).pack(side=tk.LEFT)
+        
+        prev_desc = (
+            "When checked, an Open3D 3D viewer window will pop up after EACH step showing\n"
+            "the cumulative result so far (step 1 = scan 0+1, step 2 = scan 0+1+2, ...).\n"
+            "⚠ The merge process PAUSES until you close each preview window."
+        )
+        ttk.Label(lf_preview, text=prev_desc, foreground="#555", justify=tk.LEFT, wraplength=650).pack(padx=5, pady=(0, 5))
+
         ttk.Button(root, text="Merge 360 Point Clouds", command=self.do_merge_360).pack(fill=tk.X, padx=20, pady=20)
 
     def setup_360_meshing_tab(self):
@@ -526,7 +595,32 @@ class ScannerGUI:
         ttk.Label(f_t, text="Density Trim [0.0 = Watertight]:").pack(side=tk.LEFT)
         ttk.Entry(f_t, textvariable=self.m360_trim, width=10).pack(side=tk.LEFT, padx=5)
         ttk.Label(f_t, text="(>0.0 trims external overlapping bubbles)", foreground="#555").pack(side=tk.LEFT)
-        
+
+        # ── Save Normals PLY checkbox ────────────────────────────────────────────
+        lf_save_normals = ttk.LabelFrame(root, text="Save Normals Point Cloud")
+        lf_save_normals.pack(fill=tk.X, padx=10, pady=5)
+
+        f_sn_cb = ttk.Frame(lf_save_normals); f_sn_cb.pack(fill=tk.X, padx=5, pady=4)
+        ttk.Checkbutton(
+            f_sn_cb,
+            text="Save point cloud with normals after orientation step (as .PLY)",
+            variable=self.m360_save_normals
+        ).pack(side=tk.LEFT)
+
+        f_sn_path = ttk.Frame(lf_save_normals); f_sn_path.pack(fill=tk.X, padx=5, pady=4)
+        ttk.Button(
+            f_sn_path, text="Select Output .PLY",
+            command=lambda: self.sel_file_save(self.m360_normals_out, "PLY")
+        ).pack(side=tk.LEFT)
+        ttk.Entry(f_sn_path, textvariable=self.m360_normals_out).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+
+        sn_desc = (
+            "When checked, the point cloud (with estimated normal vectors embedded) is saved to\n"
+            "the chosen .PLY file BEFORE the Poisson meshing step runs.\n"
+            "Useful for inspecting or debugging the normal orientation result separately."
+        )
+        ttk.Label(lf_save_normals, text=sn_desc, foreground="#555", justify=tk.LEFT, wraplength=620).pack(padx=5, pady=(0, 5))
+
         ttk.Button(root, text="Run 360 Meshing", command=self.do_360_meshing).pack(fill=tk.X, padx=20, pady=20)
 
     def setup_turntable_tab(self):
@@ -580,37 +674,192 @@ class ScannerGUI:
         ttk.Button(root, text="START AUTO SCAN", command=self.do_auto_scan_sequence, state="normal").pack(fill=tk.X, padx=20, pady=10)
 
     def setup_stl_tab(self):
-        # Tab 6 (Final): Normal 3D meshing for flat point clouds 
-        root = self.tab_recon
+        # Tab 7 (Final): STL Reconstruction — wrapped in a scrollable canvas
+        # because the extra Normal + MeshLab sections make it too tall for a fixed window
+        main_frame = self.tab_recon
+
+        canvas = tk.Canvas(main_frame, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(main_frame, orient="vertical", command=canvas.yview)
+        root = ttk.Frame(canvas)
+        root.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        frame_id = canvas.create_window((0, 0), window=root, anchor="nw")
+        canvas.bind("<Configure>", lambda e: canvas.itemconfig(frame_id, width=e.width))
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        def _on_mousewheel(event):
+            try:
+                if self.notebook.select() == str(self.tab_recon):
+                    canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+            except Exception:
+                pass
+        canvas.bind_all("<MouseWheel>", _on_mousewheel, add="+")
+
         ttk.Label(root, text="STL Reconstruction", font=("Arial", 14, "bold")).pack(pady=10)
-        
+
+        # ── Files ──────────────────────────────────────────────────────────────
         lf_files = ttk.LabelFrame(root, text="Files")
         lf_files.pack(fill=tk.X, padx=10, pady=5)
-        
+
         f_in = ttk.Frame(lf_files); f_in.pack(fill=tk.X, padx=5, pady=5)
-        ttk.Button(f_in, text="Select Input .PLY", command=lambda: self.sel_file_load(self.s_input_ply, "PLY")).pack(side=tk.LEFT)
+        ttk.Button(f_in, text="Select Input .PLY",
+                   command=lambda: self.sel_file_load(self.s_input_ply, "PLY")).pack(side=tk.LEFT)
         ttk.Entry(f_in, textvariable=self.s_input_ply).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
-        
+
         f_out = ttk.Frame(lf_files); f_out.pack(fill=tk.X, padx=5, pady=5)
-        ttk.Button(f_out, text="Select Output .STL", command=lambda: self.sel_file_save(self.s_output_stl, "STL")).pack(side=tk.LEFT)
+        ttk.Button(f_out, text="Select Output .STL",
+                   command=lambda: self.sel_file_save(self.s_output_stl, "STL")).pack(side=tk.LEFT)
         ttk.Entry(f_out, textvariable=self.s_output_stl).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
-        
-        lf_mode = ttk.LabelFrame(root, text="Method & Parameters")
+
+        # ── Reconstruction Method ────────────────────────────────────────────────
+        lf_mode = ttk.LabelFrame(root, text="Reconstruction Method & Parameters")
         lf_mode.pack(fill=tk.X, padx=10, pady=5)
-        
+
         f_m = ttk.Frame(lf_mode); f_m.pack(fill=tk.X, padx=5, pady=5)
-        ttk.Label(f_m, text="Reconstruction Mode:").pack(side=tk.LEFT)
+        ttk.Label(f_m, text="Mode:").pack(side=tk.LEFT)
         cb = ttk.Combobox(f_m, textvariable=self.s_mode, values=["watertight", "surface"], state="readonly")
         cb.pack(side=tk.LEFT, padx=5)
-        # Changing mode will hide/show additional feature frames
         cb.bind("<<ComboboxSelected>>", self.update_stl_params)
-        
-        # Frame to show hidden variables (Hide/Show when Combobox mode changes)
+
+        # Dynamic frame that swaps between Poisson depth or Ball Radii inputs
         self.f_stl_params = ttk.Frame(lf_mode)
         self.f_stl_params.pack(fill=tk.X, padx=5, pady=5)
-        self.update_stl_params() # Refresh once
-        
+        self.update_stl_params()
+
+        # ── Normal Orientation ──────────────────────────────────────────────────
+        lf_norm = ttk.LabelFrame(root, text="Normal Vector Orientation")
+        lf_norm.pack(fill=tk.X, padx=10, pady=5)
+
+        f_cn = ttk.Frame(lf_norm); f_cn.pack(fill=tk.X, padx=5, pady=5)
+        ttk.Checkbutton(
+            f_cn,
+            text="Use Centroid-Based Outward Orientation (Recommended)",
+            variable=self.s_centroid_orient
+        ).pack(side=tk.LEFT)
+
+        norm_desc = (
+            "What it does: Calculates the geometric center of ALL points in the cloud,\n"
+            "then forces every normal vector to point AWAY from that center.\n"
+            "This prevents inside-out surfaces where normals face the wrong direction.\n"
+            "\u2714 Best for: closed objects scanned from all sides (360\u00b0 scans).\n"
+            "When OFF: uses Open3D's graph-consistency method (may fail on complex shapes)."
+        )
+        ttk.Label(lf_norm, text=norm_desc, foreground="#555", justify=tk.LEFT, wraplength=620).pack(padx=5, pady=(0,3))
+
+        # Consistency pass row (runs AFTER centroid orient to fix any remaining stray normals)
+        f_cp = ttk.Frame(lf_norm); f_cp.pack(fill=tk.X, padx=5, pady=3)
+        ttk.Checkbutton(
+            f_cp,
+            text="Consistency Pass after centroid orient  (propagates outward direction via neighborhood graph)",
+            variable=self.s_consistency_pass
+        ).pack(side=tk.LEFT)
+
+        f_cp_k = ttk.Frame(lf_norm); f_cp_k.pack(fill=tk.X, padx=5, pady=2)
+        ttk.Label(f_cp_k, text="    Neighbors (k)  [Default 30]:").pack(side=tk.LEFT)
+        ttk.Entry(f_cp_k, textvariable=self.s_consistency_k, width=8).pack(side=tk.LEFT, padx=5)
+        ttk.Label(f_cp_k, text="(Higher k = more influence per point, slower. 20-50 is typical)",
+                  foreground="#555").pack(side=tk.LEFT)
+
+        cp_desc = (
+            "    How it works: After centroid orient makes all normals face outward, this step runs\n"
+            "    orient_normals_consistent_tangent_plane(k) to check every normal against its k\n"
+            "    nearest neighbors. Any 'stray' normals still pointing inward get flipped to match\n"
+            "    the majority direction of their neighborhood.\n"
+            "    \u26a0 On very noisy clouds this may re-flip some correct normals \u2014 use with care."
+        )
+        ttk.Label(lf_norm, text=cp_desc, foreground="#555", justify=tk.LEFT, wraplength=620).pack(padx=5, pady=(0, 5))
+
+
+        # ── MeshLab Post-Processing ──────────────────────────────────────────────
+        lf_ml = ttk.LabelFrame(root, text="MeshLab Post-Processing (pymeshlab)")
+        lf_ml.pack(fill=tk.X, padx=10, pady=5)
+
+        f_ml_en = ttk.Frame(lf_ml); f_ml_en.pack(fill=tk.X, padx=5, pady=5)
+        ttk.Checkbutton(
+            f_ml_en,
+            text="Enable MeshLab post-processing  (requires: pip install pymeshlab)",
+            variable=self.s_use_meshlab
+        ).pack(side=tk.LEFT)
+
+        ml_intro = (
+            "Applies MeshLab algorithms to the mesh AFTER Open3D reconstruction.\n"
+            "Useful for smoothing rough STLs and filling small gaps or holes."
+        )
+        ttk.Label(lf_ml, text=ml_intro, foreground="#333", justify=tk.LEFT, wraplength=620).pack(padx=5, pady=(0,3))
+
+        # Smoothing type
+        f_sm_type = ttk.Frame(lf_ml); f_sm_type.pack(fill=tk.X, padx=5, pady=3)
+        ttk.Label(f_sm_type, text="Smoothing Algorithm:", width=22).pack(side=tk.LEFT)
+        ttk.Radiobutton(f_sm_type, text="Taubin (recommended — preserves shape)",
+                        variable=self.s_ml_smooth_type, value="taubin").pack(side=tk.LEFT, padx=5)
+        ttk.Radiobutton(f_sm_type, text="Laplacian (stronger — may shrink model)",
+                        variable=self.s_ml_smooth_type, value="laplacian").pack(side=tk.LEFT, padx=5)
+
+        f_sm_desc = ttk.Frame(lf_ml); f_sm_desc.pack(fill=tk.X, padx=5)
+        sm_desc_text = (
+            "  Taubin: Alternates shrink/expand steps — smooths noise without collapsing volume. Best default.\n"
+            "  Laplacian: Moves each vertex to the average of its neighbours. Stronger effect, may cause shrinkage."
+        )
+        ttk.Label(f_sm_desc, text=sm_desc_text, foreground="#555", justify=tk.LEFT, wraplength=620).pack(anchor=tk.W)
+
+        # Smoothing iterations
+        f_sm_it = ttk.Frame(lf_ml); f_sm_it.pack(fill=tk.X, padx=5, pady=3)
+        ttk.Label(f_sm_it, text="Smooth Iterations  [Default 10]:", width=30).pack(side=tk.LEFT)
+        ttk.Entry(f_sm_it, textvariable=self.s_ml_smooth_iters, width=8).pack(side=tk.LEFT, padx=5)
+        ttk.Label(f_sm_it, text="(Higher = smoother surface, more processing time)",
+                  foreground="#555").pack(side=tk.LEFT)
+
+        # Close Holes
+        f_ch = ttk.Frame(lf_ml); f_ch.pack(fill=tk.X, padx=5, pady=3)
+        ttk.Checkbutton(f_ch, text="Close Holes", variable=self.s_ml_close_holes).pack(side=tk.LEFT)
+        ttk.Label(f_ch, text="Max Hole Size (edges):", width=22).pack(side=tk.LEFT, padx=(10,0))
+        ttk.Entry(f_ch, textvariable=self.s_ml_close_max_size, width=8).pack(side=tk.LEFT, padx=5)
+
+        f_ch_desc = ttk.Frame(lf_ml); f_ch_desc.pack(fill=tk.X, padx=5)
+        ttk.Label(f_ch_desc,
+                  text="  Fills gaps/openings in the mesh smaller than 'Max Hole Size' edges.\n"
+                       "  Useful when Poisson reconstruction leaves small open patches. Default: 30.",
+                  foreground="#555", justify=tk.LEFT, wraplength=620).pack(anchor=tk.W)
+
+        # Simplify (Quadric Edge Collapse)
+        f_simp = ttk.Frame(lf_ml); f_simp.pack(fill=tk.X, padx=5, pady=3)
+        ttk.Checkbutton(f_simp, text="Simplify Mesh (Quadric Edge Collapse)",
+                        variable=self.s_ml_simplify).pack(side=tk.LEFT)
+        ttk.Label(f_simp, text="Target Faces:", width=14).pack(side=tk.LEFT, padx=(10,0))
+        ttk.Entry(f_simp, textvariable=self.s_ml_target_faces, width=10).pack(side=tk.LEFT, padx=5)
+
+        f_simp_desc = ttk.Frame(lf_ml); f_simp_desc.pack(fill=tk.X, padx=5)
+        ttk.Label(f_simp_desc,
+                  text="  Reduces number of triangles to 'Target Faces' while preserving shape as much as possible.\n"
+                       "  Recommended if STL file size is too large for 3D printing slicer. Default: 50,000 faces.",
+                  foreground="#555", justify=tk.LEFT, wraplength=620).pack(anchor=tk.W)
+
+        # ── Save Normals PLY (same option as 360 Meshing tab) ───────────────────────
+        lf_sn = ttk.LabelFrame(root, text="Save Normals Point Cloud")
+        lf_sn.pack(fill=tk.X, padx=10, pady=5)
+
+        f_sn_cb = ttk.Frame(lf_sn); f_sn_cb.pack(fill=tk.X, padx=5, pady=4)
+        ttk.Checkbutton(
+            f_sn_cb,
+            text="Save point cloud with normals after orientation step (as .PLY)",
+            variable=self.s_save_normals
+        ).pack(side=tk.LEFT)
+
+        f_sn_path = ttk.Frame(lf_sn); f_sn_path.pack(fill=tk.X, padx=5, pady=4)
+        ttk.Button(
+            f_sn_path, text="Select Output .PLY",
+            command=lambda: self.sel_file_save(self.s_normals_out, "PLY")
+        ).pack(side=tk.LEFT)
+        ttk.Entry(f_sn_path, textvariable=self.s_normals_out).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+
+        ttk.Label(lf_sn,
+                  text="Saves the point cloud (with normal vectors embedded) BEFORE meshing begins.\n"
+                       "Open in CloudCompare or MeshLab to verify normals are facing outward correctly.",
+                  foreground="#555", justify=tk.LEFT, wraplength=620).pack(padx=5, pady=(0, 5))
+
         ttk.Button(root, text="Run STL Reconstruction", command=self.do_stl_recon).pack(fill=tk.X, padx=20, pady=20)
+
 
     def setup_calib_check_tab(self):
         # Tab 8: Visualize Calibration 3D space
@@ -849,122 +1098,141 @@ class ScannerGUI:
         threading.Thread(target=run, daemon=True).start()
 
     def do_batch_processing(self):
-        # Run Tab 3 (Batch remove noise + background)
-        in_dir = self.proc_input_dir.get()
-        out_dir = self.proc_output_dir.get()
-        
-        # Check if any folder path input fields are empty
-        if not in_dir or not out_dir:
-            messagebox.showerror("Error", "Please select input and output folders.")
-            return
-            
+        # Run Tab 3 — supports both Single-File mode and Folder-Batch mode
+        mode = self.proc_mode.get()
+
         # Check that the user selects at least one cleaning process
-        if not any([self.enable_bg_removal.get(), self.enable_outlier_removal.get(), 
+        if not any([self.enable_bg_removal.get(), self.enable_outlier_removal.get(),
                     self.enable_radius_outlier.get(), self.enable_cluster.get()]):
-            messagebox.showwarning("Warning", "Please select at least one cleaning process!")
+            messagebox.showwarning("Warning", "Please enable at least one cleaning step!")
             return
 
-        def run():
-            # Pull all point cloud files with .ply extension in the Source folder
-            import glob
-            ply_files = glob.glob(os.path.join(in_dir, "*.ply"))
-            if not ply_files:
-                self.root.after(0, lambda: messagebox.showerror("Error", "No .ply files found in input directory."))
+        # ── Helper: run the full cleaning pipeline on a single file path ──────
+        def process_one(path, final_output_path):
+            """Apply the enabled pipeline steps to 'path' and save to 'final_output_path'."""
+            filename = os.path.basename(path)
+            current_data = path  # Start with the raw file path; each step may return an object
+
+            # 1. Background Removal (Plane Segmentation)
+            if self.enable_bg_removal.get():
+                try:
+                    current_data = self.processor.remove_background(
+                        input_data=current_data, output_path=None,
+                        distance_threshold=self.bg_dist_thresh.get(),
+                        ransac_n=self.bg_ransac_n.get(),
+                        num_iterations=self.bg_iterations.get(),
+                        return_obj=True
+                    )
+                except Exception as e:
+                    print(f"[BG] Error on {filename}: {e}")
+                    return False
+
+            # 2. Keep Largest Cluster (DBSCAN)
+            if self.enable_cluster.get():
+                try:
+                    current_data = self.processor.keep_largest_cluster(
+                        input_data=current_data, output_path=None,
+                        eps=self.proc_cluster_eps.get(),
+                        min_points=self.proc_cluster_min.get(),
+                        return_obj=True
+                    )
+                except Exception as e:
+                    print(f"[Cluster] Error on {filename}: {e}")
+                    return False
+
+            # 3. Radius Outlier Removal
+            if self.enable_radius_outlier.get():
+                try:
+                    current_data = self.processor.remove_radius_outlier(
+                        input_data=current_data, output_path=None,
+                        nb_points=self.proc_radius_nb.get(),
+                        radius=self.proc_radius_r.get(),
+                        return_obj=True
+                    )
+                except Exception as e:
+                    print(f"[RadOutlier] Error on {filename}: {e}")
+                    return False
+
+            # 4. Statistical Outlier Removal
+            if self.enable_outlier_removal.get():
+                try:
+                    current_data = self.processor.remove_outliers(
+                        input_data=current_data, output_path=None,
+                        nb_neighbors=self.proc_nb_neighbors.get(),
+                        std_ratio=self.proc_std_ratio.get(),
+                        return_obj=True
+                    )
+                except Exception as e:
+                    print(f"[StatOutlier] Error on {filename}: {e}")
+                    return False
+
+            # Save the result
+            import open3d as o3d
+            import shutil
+            if not isinstance(current_data, str):
+                os.makedirs(os.path.dirname(final_output_path) or ".", exist_ok=True)
+                o3d.io.write_point_cloud(final_output_path, current_data)
+                print(f"[Done] Saved -> {final_output_path}")
+            else:
+                # No step modified the cloud (all disabled); just copy the original
+                os.makedirs(os.path.dirname(final_output_path) or ".", exist_ok=True)
+                shutil.copy(path, final_output_path)
+                print(f"[Copied] -> {final_output_path}")
+            return True
+
+        # ── Single-File mode ─────────────────────────────────────────────────
+        if mode == "file":
+            in_file = self.proc_input_file.get()
+            out_file = self.proc_output_file.get()
+
+            if not in_file or not out_file:
+                messagebox.showerror("Error", "Please select both an Input .PLY file and an Output .PLY file.")
                 return
-                
-            os.makedirs(out_dir, exist_ok=True)
-            
-            # Assign task to batch process files sequentially in queue
-            for path in ply_files:
-                filename = os.path.basename(path)
-                final_output_path = os.path.join(out_dir, filename)
-                
-                # Store Point Cloud data to be processed (initially the original file)
-                current_data = path 
-                
-                # 📌 1. Intelligent Background Wall Reduction Process (Plane Segmentation)
-                if self.enable_bg_removal.get():
-                    bg_dist = self.bg_dist_thresh.get()
-                    bg_rn = self.bg_ransac_n.get()
-                    bg_iters = self.bg_iterations.get()
-                    try:
-                        current_data = self.processor.remove_background(
-                            input_data=current_data,
-                            output_path=None, # Save only at the end
-                            distance_threshold=bg_dist,
-                            ransac_n=bg_rn,
-                            num_iterations=bg_iters,
-                            return_obj=True # Must return the model to continue to the next step
-                        )
-                    except Exception as e:
-                        print(f"Error BG removal on {filename}: {e}")
-                        continue
-                        
-                # 📌 2. Keep Largest Cluster
-                if self.enable_cluster.get():
-                    eps = self.proc_cluster_eps.get()
-                    min_pts = self.proc_cluster_min.get()
-                    try:
-                        current_data = self.processor.keep_largest_cluster(
-                            input_data=current_data,
-                            output_path=None,
-                            eps=eps,
-                            min_points=min_pts,
-                            return_obj=True
-                        )
-                    except Exception as e:
-                         print(f"Error Largest Cluster on {filename}: {e}")
-                         continue
+            if not os.path.isfile(in_file):
+                messagebox.showerror("Error", f"Input file not found:\n{in_file}")
+                return
 
-                # 📌 3. Radius Outlier Removal
-                if self.enable_radius_outlier.get():
-                    nb = self.proc_radius_nb.get()
-                    rad = self.proc_radius_r.get()
-                    try:
-                         current_data = self.processor.remove_radius_outlier(
-                             input_data=current_data,
-                             output_path=None,
-                             nb_points=nb,
-                             radius=rad,
-                             return_obj=True
-                         )
-                    except Exception as e:
-                         print(f"Error Radius Outlier on {filename}: {e}")
-                         continue
-
-                # 📌 4. Statistical Outlier Removal Process
-                if self.enable_outlier_removal.get():
-                    nb = self.proc_nb_neighbors.get()
-                    sr = self.proc_std_ratio.get()
-                    try:
-                        current_data = self.processor.remove_outliers(
-                            input_data=current_data, 
-                            output_path=None, 
-                            nb_neighbors=nb, 
-                            std_ratio=sr,
-                            return_obj=True
-                        )
-                    except Exception as e:
-                        print(f"Error Outlier removal on {filename}: {e}")
-                        continue
-                
-                # If no Error and passes pipeline, save to file
-                if not isinstance(current_data, str): 
-                    import open3d as o3d
-                    o3d.io.write_point_cloud(final_output_path, current_data)
-                    print(f"[Done] Saved to {final_output_path}")
+            def run_file():
+                ok = process_one(in_file, out_file)
+                if ok:
+                    self.root.after(0, lambda: messagebox.showinfo("Done", f"Saved to:\n{out_file}"))
                 else:
-                    import shutil
-                    shutil.copy(path, final_output_path)
-                    print(f"[Copied] Saved untouched to {final_output_path}")
-                        
-            # Pop up clear notification when all tasks finish at once 
-            self.root.after(0, lambda: messagebox.showinfo("Done", "Batch processing finished!"))
-            
-        threading.Thread(target=run, daemon=True).start()
+                    self.root.after(0, lambda: messagebox.showerror("Error", "Processing failed. Check console output."))
+
+            threading.Thread(target=run_file, daemon=True).start()
+
+        # ── Folder-Batch mode ────────────────────────────────────────────────
+        else:
+            in_dir = self.proc_input_dir.get()
+            out_dir = self.proc_output_dir.get()
+
+            if not in_dir or not out_dir:
+                messagebox.showerror("Error", "Please select input and output folders.")
+                return
+
+            def run_folder():
+                import glob
+                ply_files = glob.glob(os.path.join(in_dir, "*.ply"))
+                if not ply_files:
+                    self.root.after(0, lambda: messagebox.showerror("Error", "No .ply files found in input folder."))
+                    return
+
+                os.makedirs(out_dir, exist_ok=True)
+                success = 0
+                for path in ply_files:
+                    out_path = os.path.join(out_dir, os.path.basename(path))
+                    if process_one(path, out_path):
+                        success += 1
+
+                total = len(ply_files)
+                self.root.after(0, lambda: messagebox.showinfo(
+                    "Done", f"Batch complete: {success}/{total} files processed successfully."))
+
+            threading.Thread(target=run_folder, daemon=True).start()
+
 
     def do_merge_360(self):
-        # Run Tab 3 merge 360 model
+        # Run Tab 4 merge 360 model
         in_dir = self.merge_input_dir.get()
         out_file = self.merge_output_file.get()
         vx = self.merge_voxel.get()
@@ -974,52 +1242,101 @@ class ScannerGUI:
         sample_before = self.merge_sample_before.get()
         sample_after = self.merge_sample_after.get()
         final_voxel = self.merge_final_voxel.get()
+        show_preview = self.merge_show_preview.get()
         
         if not in_dir or not out_file:
             messagebox.showerror("Error", "Select Input Folder and Output File.")
             return
 
+        # --- Step preview callback ---
+        # Called from the merge thread after each step with:
+        #   step_index  : which step just finished (1-based)
+        #   total_steps : total number of merge steps
+        #   cloud_so_far: copy of the fully accumulated cloud up to this step
+        # The Open3D draw_geometries() call here is BLOCKING — the merge pauses
+        # until the user closes the 3D window. This only runs if the checkbox is ticked.
+        def step_preview_callback(step_index, total_steps, cloud_so_far):
+            import open3d as o3d
+            # Build a human-readable title showing which scans are accumulated
+            # e.g. step 2/5 shows scans 0+1+2
+            scan_labels = "+".join(str(k) for k in range(step_index + 1))
+            window_title = f"Step {step_index}/{total_steps}  |  Accumulated scans: {scan_labels}  (close to continue)"
+            print(f"[Preview] Opening 3D viewer: {window_title}")
+            # Assign a distinct color so each step is easy to identify (optional: uniform colour for clean look)
+            o3d.visualization.draw_geometries(
+                [cloud_so_far],
+                window_name=window_title,
+                width=900,
+                height=700,
+                point_show_normal=False
+            )
+            print(f"[Preview] Window closed, continuing to next step...")
+
+        # Only attach the callback when the checkbox is ticked
+        callback = step_preview_callback if show_preview else None
+
         def run():
             try:
-                self.processor.merge_pro_360(in_dir, out_file, vx, icp_dist, outlier_nb, outlier_std, sample_before, sample_after, final_voxel)
+                self.processor.merge_pro_360(
+                    in_dir, out_file,
+                    vx, icp_dist,
+                    outlier_nb, outlier_std,
+                    sample_before, sample_after,
+                    final_voxel,
+                    step_callback=callback  # None = no preview; function = blocking popup per step
+                )
                 self.root.after(0, lambda: messagebox.showinfo("Merge Done", f"Saved merged cloud to:\n{out_file}"))
             except Exception as e:
-                 err_msg = str(e)
-                 print(err_msg)
-                 self.root.after(0, lambda: messagebox.showerror("Error", err_msg))
+                err_msg = str(e)
+                print(err_msg)
+                self.root.after(0, lambda: messagebox.showerror("Error", err_msg))
         
         threading.Thread(target=run, daemon=True).start()
 
     def do_360_meshing(self):
-        # Run Tab 4 Normal Mesh 
-        in_file = self.m360_input_ply.get()
+        # Run Tab 5 Normal Mesh
+        in_file  = self.m360_input_ply.get()
         out_file = self.m360_output_stl.get()
-        mode = self.m360_mode.get()
-        depth = self.m360_depth.get()
-        trim = self.m360_trim.get()
-        
-        # Retrieve the advanced Poisson settings from UI
-        p_width = self.m360_width.get()
-        p_scale = self.m360_scale.get()
-        p_linear = self.m360_linear_fit.get()
+        mode     = self.m360_mode.get()
+        depth    = self.m360_depth.get()
+        trim     = self.m360_trim.get()
+
+        # Advanced Poisson settings from UI
+        p_width   = self.m360_width.get()
+        p_scale   = self.m360_scale.get()
+        p_linear  = self.m360_linear_fit.get()
         p_threads = self.m360_threads.get()
-        
-        # Retrieve Normal Estimation parameters
+
+        # Normal Estimation parameters
         n_rad = self.m360_normal_radius.get()
         n_max = self.m360_normal_max_nn.get()
-        
+
+        # Save-normals PLY option
+        save_normals_path = None
+        if self.m360_save_normals.get():
+            save_normals_path = self.m360_normals_out.get()
+            if not save_normals_path:
+                messagebox.showerror("Error", "Please select an output path for the normals .PLY file.")
+                return
+
         if not os.path.isfile(in_file):
             messagebox.showerror("Error", "Input .PLY not found.")
             return
-            
+
         def run_thread():
             try:
-                self.sys_log(f"Starting 360 Meshing (Poisson):\nDepth: {depth}, Trim: {trim}, Mode: {mode}, Threads: {p_threads}\nNormals (Rad: {n_rad}, MaxNN: {n_max})")
+                self.sys_log(
+                    f"Starting 360 Meshing (Poisson):\nDepth: {depth}, Trim: {trim}, "
+                    f"Mode: {mode}, Threads: {p_threads}\n"
+                    f"Normals (Rad: {n_rad}, MaxNN: {n_max})"
+                    + (f"\nSave normals PLY: {save_normals_path}" if save_normals_path else "")
+                )
                 self.processor.mesh_360(
-                    input_path=in_file, output_path=out_file, 
+                    input_path=in_file, output_path=out_file,
                     depth=depth, density_trim=trim, orientation_mode=mode,
                     width=p_width, scale=p_scale, linear_fit=p_linear, n_threads=p_threads,
-                    normal_radius=n_rad, normal_max_nn=n_max
+                    normal_radius=n_rad, normal_max_nn=n_max,
+                    save_normals_path=save_normals_path   # None = skip saving
                 )
                 self.sys_log("360 Meshing complete.")
                 self.root.after(0, lambda: messagebox.showinfo("Done", f"360 Mesh Saved to:\n{out_file}"))
@@ -1027,30 +1344,66 @@ class ScannerGUI:
                 err_msg = str(e)
                 print(f"Error: {e}")
                 self.root.after(0, lambda: messagebox.showerror("Error", err_msg))
-                # Don't popup error if thread dying... print is safer.
-        
+
         threading.Thread(target=run_thread, daemon=True).start()
 
+
     def do_stl_recon(self):
-        # Run Tab 6 basic operations
+        # Run Tab 7 STL Reconstruction with optional centroid normal orient + MeshLab post-processing
         i = self.s_input_ply.get()
         o = self.s_output_stl.get()
         m = self.s_mode.get()
-        
+
         params = {}
         if m == "watertight": params["depth"] = self.s_depth.get()
         else: params["radii"] = self.s_radii.get()
-        
-        if not i or not o: messagebox.showerror("Error", "Select files first."); return
-        
+
+        if not i or not o:
+            messagebox.showerror("Error", "Select files first.")
+            return
+
+        # Collect the centroid normal orientation flag
+        use_centroid = self.s_centroid_orient.get()
+        # Consistency pass: propagate outward direction through neighborhood after centroid orient
+        use_consistency = self.s_consistency_pass.get()
+        consistency_k   = self.s_consistency_k.get()
+
+        # Build the MeshLab params dict (only passed if enabled)
+        meshlab_params = None
+        if self.s_use_meshlab.get():
+            meshlab_params = {
+                "enabled": True,
+                "smooth_type":    self.s_ml_smooth_type.get(),
+                "smooth_iters":   self.s_ml_smooth_iters.get(),
+                "close_holes":    self.s_ml_close_holes.get(),
+                "close_max_size": self.s_ml_close_max_size.get(),
+                "simplify":       self.s_ml_simplify.get(),
+                "target_faces":   self.s_ml_target_faces.get(),
+            }
+
+        # Save-normals PLY option
+        save_normals_path = None
+        if self.s_save_normals.get():
+            save_normals_path = self.s_normals_out.get()
+            if not save_normals_path:
+                messagebox.showerror("Error", "Please select an output path for the normals .PLY file.")
+                return
+
         def run():
             try:
-                self.processor.reconstruct_stl(i, o, m, params)
+                self.processor.reconstruct_stl(
+                    i, o, m, params,
+                    centroid_orient=use_centroid,
+                    consistency_pass=use_consistency,
+                    consistency_k=consistency_k,
+                    meshlab_params=meshlab_params,
+                    save_normals_path=save_normals_path
+                )
                 self.root.after(0, lambda: messagebox.showinfo("Done", f"STL Saved to:\n{o}"))
             except Exception as e:
                 err_msg = str(e)
                 self.root.after(0, lambda: messagebox.showerror("Error", err_msg))
-        
+
         threading.Thread(target=run, daemon=True).start()
 
     def do_auto_scan_sequence(self):

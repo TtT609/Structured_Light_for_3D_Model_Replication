@@ -342,8 +342,10 @@ class ProcessingLogic:
         return result
 
     @staticmethod
-    def merge_pro_360(input_folder, output_path, voxel_size=0.02, icp_dist_ratio=1.5, outlier_nb=20, outlier_std=2.0, sample_before=1, sample_after=1, final_voxel=0.5):
+    def merge_pro_360(input_folder, output_path, voxel_size=0.02, icp_dist_ratio=1.5, outlier_nb=20, outlier_std=2.0, sample_before=1, sample_after=1, final_voxel=0.5, step_callback=None):
         # Main function to sequence and merge 3D models obtained from a 360-degree scan (multiple angles) together
+        # step_callback: optional function(step_index, total_steps, accumulated_cloud) called after each merge step
+        #                When provided, the UI can use this to show a 3D preview popup for that step
         print(f"[Merge 360] Loading clouds from {input_folder}...")
         
         # Find all .ply files in the folder
@@ -371,6 +373,9 @@ class ProcessingLogic:
             return 0 # Default if parsing fails
 
         ply_files = sorted(ply_files, key=extract_degree)
+        print(f"[Merge 360] Sorted file order:")
+        for idx, f in enumerate(ply_files):
+            print(f"  [{idx}] {os.path.basename(f)}")
         
         if len(ply_files) < 2:
             raise ValueError("Need at least 2 .ply files to merge.") # Must have at least 2 models to be able to merge
@@ -379,12 +384,16 @@ class ProcessingLogic:
         for path in ply_files:
             # Load each model file into a loop to store as a List (pcds)
             pcd = o3d.io.read_point_cloud(path)
+            if not pcd.has_points():
+                raise ValueError(f"Loaded empty point cloud from: {path}")
             # Apply initial sampling if requested
             if sample_before > 1:
                 pcd = pcd.uniform_down_sample(every_k_points=int(sample_before))
             pcds.append(pcd)
+            print(f"  Loaded: {os.path.basename(path)} ({len(pcd.points)} points)")
             
-        print(f"[Merge 360] Loaded {len(pcds)} clouds. Running Sequential Registration (New360 Logic)...")
+        total_steps = len(pcds) - 1
+        print(f"[Merge 360] Loaded {len(pcds)} clouds. Running Sequential Registration ({total_steps} steps)...")
         
         # Set the starting model to be the first model (Frame 0) as the base (Accumulator)
         merged_cloud = copy.deepcopy(pcds[0])
@@ -394,23 +403,39 @@ class ProcessingLogic:
         
         # Loop to compare and connect models pair by pair (Model 1 to 0, Model 2 to 1,...) continuously 
         for i in range(1, len(pcds)):
-            print(f"[Merge 360] Aligning Scan {i} -> Scan {i-1}...")
+            print(f"\n[Merge 360] === Step {i}/{total_steps}: Aligning Scan {i} -> Scan {i-1} ===")
             source = pcds[i]      # Latest model (moving towards target)
             target = pcds[i-1]    # Previous model (standing still)
             
             # 1. Preprocess prepare both data (Downsample + calculate Normals)
             source_down, source_fpfh = ProcessingLogic.preprocess_point_cloud(source, voxel_size)
             target_down, target_fpfh = ProcessingLogic.preprocess_point_cloud(target, voxel_size)
+            print(f"  Preprocessed: source={len(source_down.points)} pts, target={len(target_down.points)} pts (voxel={voxel_size})")
             
             # 2. Let Open3D try to blindly guess the broad overlapping position first (Global RANSAC)
             # Pass down the icp_dist_ratio multiplier to control the strictness of the search
             ransac_result = ProcessingLogic.execute_global_registration(
                 source_down, target_down, source_fpfh, target_fpfh, voxel_size, icp_dist_ratio)
             
-            # 3. Let Open3D precisely adjust the overlap from the original distance (Local ICP Refinement Point-to-Plane)
+            # --- Fitness check after RANSAC ---
+            # Fitness near 0.0 = very few matched points = bad initial alignment guess
+            print(f"  [RANSAC] Fitness: {ransac_result.fitness:.4f} | RMSE: {ransac_result.inlier_rmse:.6f}")
+            if ransac_result.fitness < 0.05:
+                print(f"  [WARNING] Step {i}: RANSAC fitness is very low ({ransac_result.fitness:.4f})! "
+                      f"Alignment may be unreliable. Try lowering Voxel Size or increasing ICP Dist Ratio.")
+            
+            # 3. Let Open3D precisely adjust the overlap from the initial RANSAC guess (Local ICP Refinement Point-to-Plane)
             icp_result = o3d.pipelines.registration.registration_icp(
                 source_down, target_down, voxel_size, ransac_result.transformation,
                 o3d.pipelines.registration.TransformationEstimationPointToPlane())
+            
+            # --- Fitness check after ICP ---
+            # If fitness is still very low here, this step's merge will be corrupted and affect all subsequent steps
+            print(f"  [ICP]    Fitness: {icp_result.fitness:.4f} | RMSE: {icp_result.inlier_rmse:.6f}")
+            if icp_result.fitness < 0.05:
+                print(f"  [WARNING] Step {i}: ICP fitness is very low ({icp_result.fitness:.4f})! "
+                      f"This step's alignment is likely incorrect and WILL corrupt all subsequent steps. "
+                      f"Consider adjusting parameters or checking if all PLY files are valid.")
             
             # Extract the relationship matrix to shift the position between i and i-1 to store
             T_local = icp_result.transformation 
@@ -423,20 +448,34 @@ class ProcessingLogic:
             pcd_temp.transform(max_accum_T) # Change the position of the latest model and overlap it
             merged_cloud += pcd_temp        # Combine together
             
+            print(f"  [Merge 360] Step {i}/{total_steps} complete. Accumulated cloud: {len(merged_cloud.points)} points total.")
+            
+            # 6. If a step_callback is registered (e.g. from GUI checkbox), call it now with a snapshot
+            #    of the current accumulated cloud. This allows the GUI to display a 3D preview popup.
+            #    The merge process will pause here (blocking) until the callback returns.
+            if step_callback is not None:
+                # Provide a lightweight copy to avoid mutating the live accumulator
+                preview_cloud = copy.deepcopy(merged_cloud)
+                step_callback(i, total_steps, preview_cloud)
+            
+        print(f"\n[Merge 360] All {total_steps} steps complete. Running post-processing...")
         print(f"[Merge 360] Post-processing (Final Voxel: {final_voxel}, Outlier removal)...")
         # Take the entire large finished model and reduce its resolution one last time to prevent the computer from lagging (optional if user set Final Voxel to >0)
         pcd_combined_down = merged_cloud
         if final_voxel > 0:
             pcd_combined_down = merged_cloud.voxel_down_sample(voxel_size=final_voxel)
+            print(f"  After final voxel down-sample: {len(pcd_combined_down.points)} points")
         
         # Apply after merge sampling if requested
         if sample_after > 1:
             pcd_combined_down = pcd_combined_down.uniform_down_sample(every_k_points=int(sample_after))
+            print(f"  After uniform sample-after: {len(pcd_combined_down.points)} points")
         
         # Filter out bad points for the final time of merging (Outlier Removal)
         # using the UI-defined parameters for neighbor count and standard deviation aggressiveness
         cl, ind = pcd_combined_down.remove_statistical_outlier(nb_neighbors=outlier_nb, std_ratio=outlier_std)
         pcd_final = pcd_combined_down.select_by_index(ind)
+        print(f"  After outlier removal: {len(pcd_final.points)} points (removed {len(pcd_combined_down.points) - len(pcd_final.points)})")
         
         # Calculate the latest surface Normals for the large model
         pcd_final.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size*2, max_nn=30))
@@ -446,8 +485,17 @@ class ProcessingLogic:
         print(f"[Merge 360] Saved merged cloud to {output_path}")
 
     @staticmethod
-    def reconstruct_stl(input_path, output_path, mode="watertight", params=None):
+    def reconstruct_stl(input_path, output_path, mode="watertight", params=None, centroid_orient=True, consistency_pass=False, consistency_k=30, meshlab_params=None, save_normals_path=None):
         # Function used to create a 3D wireframe or solid mesh (STL from Point Cloud), suitable for 3D printing tasks
+        # centroid_orient:   When True, calculates the geometric center of all points and forces every
+        #                    normal to point OUTWARD from that center. More reliable than graph-consistency.
+        # consistency_pass:  When True (and centroid_orient is True), runs orient_normals_consistent_
+        #                    tangent_plane(k) AFTER centroid orient to propagate the outward direction
+        #                    via the neighborhood graph, fixing any remaining stray normals.
+        # consistency_k:     Number of nearest neighbors for the consistency pass (default 30).
+        # meshlab_params:    Optional dict with MeshLab post-processing options (requires pymeshlab).
+        # save_normals_path: Optional .ply path — if set, saves the point cloud WITH normals embedded
+        #                    immediately after orientation (before meshing). Useful for debugging.
         if not os.path.exists(input_path):
             raise FileNotFoundError(f"Input file not found: {input_path}")
             
@@ -457,14 +505,49 @@ class ProcessingLogic:
         if not pcd.has_points():
             raise ValueError("Point cloud is empty.")
             
-        # Create initial Normals (surface direction) immediately if the source file doesn't provide them, otherwise it cannot be shaded
+        # --- Normal Estimation & Orientation ---
         if not pcd.has_normals():
             print("[Recon] Estimating normals...")
             pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=10, max_nn=30))
-            # Check and rotate all Normal lines to point in the same direction
+
+        if centroid_orient:
+            # CENTROID METHOD: 
+            # 1. Compute the geometric center (mean of all point positions)
+            # 2. Use Open3D's orient_normals_towards_camera_location() with the centroid as
+            #    the "camera" — this makes ALL normals point TOWARD the centroid (inward)
+            # 3. Multiply all normals by -1 to flip them OUTWARD from the centroid
+            # This is highly reliable for closed objects (e.g., 360-degree scans)
+            center = np.asarray(pcd.points).mean(axis=0)  # Centroid = average of all XYZ coordinates
+            print(f"[Recon] Centroid normal orient: center = [{center[0]:.3f}, {center[1]:.3f}, {center[2]:.3f}]")
+            pcd.orient_normals_towards_camera_location(center)   # Orient inward toward centroid
+            pcd.normals = o3d.utility.Vector3dVector(            # Flip to outward
+                np.asarray(pcd.normals) * -1.0
+            )
+            print("[Recon] Centroid-based outward orientation applied.")
+        else:
+            # GRAPH METHOD: check and rotate all Normal lines to point in the same direction
+            # using a minimum spanning tree on the normal directions (may fail on complex shapes)
+            print("[Recon] Using tangent-plane graph consistency for normal orientation...")
             pcd.orient_normals_consistent_tangent_plane(100)
-            
-        mesh = None
+            print("[Recon] Graph orientation applied.")
+
+        # Consistency pass: propagate the outward direction via neighborhood graph to fix stray normals
+        # This runs orient_normals_consistent_tangent_plane(k) a second time AFTER centroid orient.
+        # Because centroid orient already set the global outward direction, the graph pass now has a
+        # reliable reference and will flip any remaining "stray" inward-facing normals to match.
+        if consistency_pass:
+            k = int(consistency_k) if consistency_k > 0 else 30
+            print(f"[Recon] Consistency pass: orient_normals_consistent_tangent_plane(k={k})...")
+            pcd.orient_normals_consistent_tangent_plane(k)
+            print("[Recon] Consistency pass applied.")
+
+        # Optionally save the point cloud with normals embedded, BEFORE meshing
+        # Allows the user to open the result in CloudCompare / MeshLab and verify normals face outward
+        if save_normals_path:
+            print(f"[Recon] Saving normals point cloud to {save_normals_path}...")
+            o3d.io.write_point_cloud(save_normals_path, pcd)
+            print(f"[Recon] Normals point cloud saved ({len(pcd.points)} points).")
+
         if mode == "watertight":
             # Create a 3D wireframe mesh that closes leaks and is completely sealed (Poisson Surface Reconstruction)
             depth = int(params.get("depth", 10)) # Get depth/resolution value 
@@ -512,9 +595,59 @@ class ProcessingLogic:
         o3d.io.write_triangle_mesh(output_path, mesh) # Save .stl file (or other extensions that Open3D supports)
         print(f"[Recon] Saved STL to {output_path}")
 
+        # --- MeshLab Post-Processing (optional, requires pymeshlab) ---
+        # Runs AFTER the Open3D save so the intermediate result is always safe even if MeshLab fails
+        if meshlab_params and meshlab_params.get("enabled"):
+            print("[MeshLab] Starting post-processing...")
+            try:
+                import pymeshlab
+            except ImportError:
+                raise ImportError(
+                    "pymeshlab is not installed. Run: pip install pymeshlab\n"
+                    "The STL has already been saved using Open3D only (without MeshLab improvements)."
+                )
+
+            ms = pymeshlab.MeshSet()
+            ms.load_new_mesh(output_path)  # Load the STL we just saved
+            print(f"[MeshLab] Loaded mesh: {ms.current_mesh().vertex_number()} vertices, "
+                  f"{ms.current_mesh().face_number()} faces")
+
+            # 1. Smoothing
+            smooth_type  = str(meshlab_params.get("smooth_type", "taubin"))
+            smooth_iters = int(meshlab_params.get("smooth_iters", 10))
+            if smooth_type == "laplacian":
+                # Laplacian: moves each vertex toward the mean of its neighbours — stronger, may shrink model
+                print(f"[MeshLab] Applying Laplacian smoothing ({smooth_iters} iterations)...")
+                ms.apply_coord_laplacian_smoothing(stepsmoothnum=smooth_iters)
+            else:
+                # Taubin: alternates positive/negative lambda steps — preserves volume better
+                print(f"[MeshLab] Applying Taubin smoothing ({smooth_iters} iterations)...")
+                ms.apply_coord_taubin_smoothing(stepsmoothnum=smooth_iters)
+
+            # 2. Close Holes (fill gaps smaller than max_size edges)
+            if meshlab_params.get("close_holes"):
+                max_size = int(meshlab_params.get("close_max_size", 30))
+                print(f"[MeshLab] Closing holes (max hole size = {max_size} edges)...")
+                ms.meshing_close_holes(maxholesize=max_size)
+
+            # 3. Mesh Simplification (Quadric Edge Collapse Decimation)
+            if meshlab_params.get("simplify"):
+                target = int(meshlab_params.get("target_faces", 50000))
+                print(f"[MeshLab] Simplifying mesh to {target} faces...")
+                ms.meshing_decimation_quadric_edge_collapse(targetfacenum=target)
+
+            # Overwrite the output file with the MeshLab-improved mesh
+            ms.save_current_mesh(output_path)
+            final = ms.current_mesh()
+            print(f"[MeshLab] Post-processing complete. Final: {final.vertex_number()} vertices, "
+                  f"{final.face_number()} faces. Saved to {output_path}")
+
+
     @staticmethod
-    def mesh_360(input_path, output_path, depth=10, density_trim=0.01, orientation_mode="tangent", width=0.0, scale=1.1, linear_fit=False, n_threads=-1, normal_radius=0.1, normal_max_nn=30):
+    def mesh_360(input_path, output_path, depth=10, density_trim=0.01, orientation_mode="tangent", width=0.0, scale=1.1, linear_fit=False, n_threads=-1, normal_radius=0.1, normal_max_nn=30, save_normals_path=None):
         # Function to create and refine the Mesh specifically for processing models from a 360-degree all-around scan
+        # save_normals_path: optional file path (.ply) to save the point cloud AFTER normal estimation
+        #                    and orientation, but BEFORE Poisson meshing. Useful for inspection/debugging.
         if not os.path.exists(input_path):
             raise FileNotFoundError(f"Input file not found: {input_path}")
             
@@ -551,6 +684,13 @@ class ProcessingLogic:
                 center = pcd.get_center()
                 pcd.orient_normals_towards_camera_location(center)
                 pcd.normals = o3d.utility.Vector3dVector(np.asarray(pcd.normals) * -1.0)
+
+        # 2b. Optionally save the point cloud with normals embedded, BEFORE meshing
+        #     This lets you inspect the normal orientation result as a separate .ply file
+        if save_normals_path:
+            print(f"[360 Mesh] Saving normals point cloud to {save_normals_path}...")
+            o3d.io.write_point_cloud(save_normals_path, pcd)
+            print(f"[360 Mesh] Normals point cloud saved ({len(pcd.points)} points).")
 
         # 3. Form the Mesh body to fill the model using Screened Poisson Reconstruction
         print(f"[360 Mesh] Poisson Reconstruction (depth={depth}, width={width}, scale={scale}, linear={linear_fit}, threads={n_threads})...")

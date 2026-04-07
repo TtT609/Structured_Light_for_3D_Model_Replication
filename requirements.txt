@@ -5,3 +5,5 @@ Flask
 flask-cors
 open3d
 pyserial
+# pymeshlab  # Optional: needed for MeshLab post-processing in Tab 7 STL Reconstruction
+#            # Install with: pip install pymeshlab
