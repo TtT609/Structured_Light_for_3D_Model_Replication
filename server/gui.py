@@ -44,9 +44,25 @@ class ScannerGUI:
         self.scan_capture_dir = tk.StringVar(value=os.path.join(DEFAULT_ROOT, "scans", "object_01"))
         
         # --- State Variables (Multi PLY Process - Tab 2) ---
-        self.mpcp_calib_file = tk.StringVar(value=os.path.join(DEFAULT_ROOT, "calib", "calib.mat"))
-        self.mpcp_input_path = tk.StringVar()
-        self.mpcp_mode = tk.StringVar(value="single") # 'single' or 'batch'
+        self.mpcp_calib_file  = tk.StringVar(value=os.path.join(DEFAULT_ROOT, "calib", "calib.mat"))
+        self.mpcp_input_path  = tk.StringVar()
+        self.mpcp_mode        = tk.StringVar(value="single")  # 'single' | 'files'
+        self.mpcp_batch       = tk.BooleanVar(value=False)
+
+        # How many of the FIRST (coarsest) bit-planes to use per axis (1-11, default 11 = all)
+        self.mpcp_col_sets = tk.StringVar(value="11")
+        self.mpcp_row_sets = tk.StringVar(value="11")
+        
+        # Row Processing Mode
+        self.mpcp_row_mode = tk.IntVar(value=1) # 0=None, 1=Epipolar, 2=Merge
+        self.mpcp_epipolar_tol = tk.StringVar(value="2.0")
+
+        # Thresholds
+        self.mpcp_thresh_mode = tk.StringVar(value="otsu") # otsu or manual
+        self.mpcp_shadow_val = tk.StringVar(value="40")
+        self.mpcp_contrast_val = tk.StringVar(value="10")
+
+        self.mpcp_selected_files = []  # used when mode == 'files'
         
         # --- State Variables (Combined Processing - Tab 3) ---
         # Toggle: process a single file or an entire folder batch
@@ -192,43 +208,219 @@ class ScannerGUI:
     # GUI Layout Functions for Each Tab
     # ==========================================
     def setup_multiPCP_tab(self):
-        # screen 2: Multi .ply process (Batch Point Cloud Generator)
-        root = self.tab_multiPCP
-        ttk.Label(root, text="Batch Point Cloud Generator", font=("Arial", 14, "bold")).pack(pady=10)
-        
-        # 1. Calibration Section
+        # Tab 2: Multi .ply process — Batch Point Cloud Generator
+        # Wrapped in a canvas so it can scroll if the window is small
+        main_frame = self.tab_multiPCP
+
+        canvas  = tk.Canvas(main_frame, highlightthickness=0)
+        scrollb = ttk.Scrollbar(main_frame, orient="vertical", command=canvas.yview)
+        root    = ttk.Frame(canvas)
+        root.bind("<Configure>",
+                  lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        fid = canvas.create_window((0, 0), window=root, anchor="nw")
+        canvas.bind("<Configure>", lambda e: canvas.itemconfig(fid, width=e.width))
+        canvas.configure(yscrollcommand=scrollb.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollb.pack(side="right", fill="y")
+
+        def _mwheel(ev):
+            try:
+                if self.notebook.select() == str(self.tab_multiPCP):
+                    canvas.yview_scroll(int(-1 * (ev.delta / 120)), "units")
+            except Exception:
+                pass
+        canvas.bind_all("<MouseWheel>", _mwheel, add="+")
+
+        ttk.Label(root, text="Batch Point Cloud Generator",
+                  font=("Arial", 14, "bold")).pack(pady=10)
+
+        # ── 1. Calibration ────────────────────────────────────────────────
         lf1 = ttk.LabelFrame(root, text="1. Calibration File (.mat)")
-        lf1.pack(fill=tk.X, padx=10, pady=10)
-        
-        f1 = ttk.Frame(lf1)
-        f1.pack(fill=tk.X, padx=5, pady=5)
-        ttk.Button(f1, text="Browse .mat", command=lambda: self.sel_file_load(self.mpcp_calib_file, "MAT")).pack(side=tk.LEFT)
-        ttk.Entry(f1, textvariable=self.mpcp_calib_file).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        lf1.pack(fill=tk.X, padx=10, pady=6)
 
-        # 2. Input Section
-        lf2 = ttk.LabelFrame(root, text="2. Input Target")
-        lf2.pack(fill=tk.X, padx=10, pady=5)
-        
-        f_radio = ttk.Frame(lf2)
-        f_radio.pack(fill=tk.X, padx=5, pady=5)
-        ttk.Radiobutton(f_radio, text="Single Scan Folder", variable=self.mpcp_mode, value="single").pack(side=tk.LEFT, padx=10)
-        ttk.Radiobutton(f_radio, text="Batch (Parent Folder of Scans)", variable=self.mpcp_mode, value="batch").pack(side=tk.LEFT, padx=10)
-        
-        f2 = ttk.Frame(lf2)
-        f2.pack(fill=tk.X, padx=5, pady=5)
-        ttk.Button(f2, text="Select Folder", command=lambda: self.sel_dir(self.mpcp_input_path)).pack(side=tk.LEFT)
-        ttk.Entry(f2, textvariable=self.mpcp_input_path).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        f1 = ttk.Frame(lf1); f1.pack(fill=tk.X, padx=5, pady=5)
+        ttk.Button(f1, text="Browse .mat",
+                   command=lambda: self.sel_file_load(self.mpcp_calib_file, "MAT")).pack(side=tk.LEFT)
+        ttk.Entry(f1, textvariable=self.mpcp_calib_file).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=5)
 
-        # 3. Execution
-        self.btn_run_mpcp = ttk.Button(root, text="START GENERATING PLY", command=self.do_multi_pcp)
-        self.btn_run_mpcp.pack(fill=tk.X, padx=20, pady=15)
+        # ── 2. Input source ───────────────────────────────────────────────
+        lf2 = ttk.LabelFrame(root, text="2. Input Source")
+        lf2.pack(fill=tk.X, padx=10, pady=6)
 
-        # 4. Logs
-        lf3 = ttk.LabelFrame(root, text="Processing Logs")
-        lf3.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        f_radio = ttk.Frame(lf2); f_radio.pack(fill=tk.X, padx=5, pady=4)
+        ttk.Radiobutton(f_radio, text="Folder (contains images)",
+                        variable=self.mpcp_mode, value="single",
+                        command=self._mpcp_on_mode).pack(side=tk.LEFT, padx=8)
+        ttk.Radiobutton(f_radio, text="Select specific image files",
+                        variable=self.mpcp_mode, value="files",
+                        command=self._mpcp_on_mode).pack(side=tk.LEFT, padx=8)
+
+        # Folder sub-row
+        self._mpcp_frame_folder = ttk.Frame(lf2)
+        self._mpcp_frame_folder.pack(fill=tk.X, padx=5, pady=2)
+
+        ttk.Checkbutton(self._mpcp_frame_folder,
+                        text="Batch mode (parent folder containing multiple scan sub-folders)",
+                        variable=self.mpcp_batch).pack(side=tk.LEFT, padx=4)
+
+        f_frow = ttk.Frame(lf2); f_frow.pack(fill=tk.X, padx=5, pady=4)
+        ttk.Button(f_frow, text="Select Folder",
+                   command=lambda: self.sel_dir(self.mpcp_input_path)).pack(side=tk.LEFT)
+        ttk.Entry(f_frow, textvariable=self.mpcp_input_path).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+
+        # File-list sub-row (hidden by default)
+        self._mpcp_frame_files = ttk.Frame(lf2)
+        f_files_row = ttk.Frame(self._mpcp_frame_files)
+        f_files_row.pack(fill=tk.X, padx=5, pady=2)
+        ttk.Button(f_files_row, text="Select Image Files",
+                   command=self._mpcp_sel_files).pack(side=tk.LEFT)
+        self._mpcp_lbl_files = ttk.Label(f_files_row, text="No files selected")
+        self._mpcp_lbl_files.pack(side=tk.LEFT, padx=8)
+
+        # ── 3. Pattern-Set Count ─────────────────────────────────────────
+        MAX_SETS = 11
+
+        lf3 = ttk.LabelFrame(
+            root,
+            text="3. Number of Pattern Sets to Use  (1 = coarsest only, 11 = all)")
+        lf3.pack(fill=tk.X, padx=10, pady=6)
+
+        desc = (
+            "Gray code encodes position using ALL bit-planes together like binary digits:\n"
+            "  Plane 1 (coarsest) splits the projector in half. Plane 11 (finest) into 2048 cells.\n"
+            "Using FEWER planes skips the finest stripes the camera can't see.\n"
+            "The coordinate is automatically scaled so 3D geometry stays correct."
+        )
+        ttk.Label(lf3, text=desc, foreground="#555", justify=tk.LEFT,
+                  wraplength=640).pack(padx=8, pady=(4, 2))
+
+        grid = ttk.Frame(lf3); grid.pack(padx=10, pady=6, anchor=tk.W)
+
+        def _spin_count(parent, label, var, row):
+            ttk.Label(parent, text=label, width=18).grid(
+                row=row, column=0, sticky="w", padx=4)
+            ttk.Button(parent, text="\u2212", width=2,
+                       command=lambda: self._mpcp_step(var, 1, MAX_SETS, -1)
+                       ).grid(row=row, column=1, padx=2)
+            ttk.Spinbox(parent, textvariable=var, from_=1, to=MAX_SETS,
+                        width=4, justify="center",
+                        command=lambda v=var: self._mpcp_clamp(v, 1, MAX_SETS)
+                        ).grid(row=row, column=2, padx=2)
+            ttk.Button(parent, text="+", width=2,
+                       command=lambda: self._mpcp_step(var, 1, MAX_SETS, +1)
+                       ).grid(row=row, column=3, padx=2)
+            ttk.Label(parent, text="/ 11", foreground="#777").grid(
+                row=row, column=4, padx=(2, 12))
+
+        _spin_count(grid, "Column patterns:", self.mpcp_col_sets, row=0)
+        _spin_count(grid, "Row patterns:",    self.mpcp_row_sets, row=1)
+
+        # Quick presets
+        pf = ttk.Frame(lf3); pf.pack(padx=10, pady=(0, 8))
+        ttk.Label(pf, text="Quick presets:").pack(side=tk.LEFT, padx=4)
+        for label, n in [("All (11)", 11), ("9", 9), ("8", 8), ("7", 7), ("6", 6)]:
+            ttk.Button(pf, text=label,
+                       command=lambda _n=n: self._mpcp_preset(_n)
+                       ).pack(side=tk.LEFT, padx=3)
+
+        # ── 4. Row Processing Mode ───────────────────────────────────────
+        lf_epio = ttk.LabelFrame(root, text="4. Row Processing Mode")
+        lf_epio.pack(fill=tk.X, padx=10, pady=6)
         
-        self.txt_log_mpcp = tk.Text(lf3, state='disabled', height=10)
-        self.txt_log_mpcp.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        f_epi = ttk.Frame(lf_epio)
+        f_epi.pack(fill=tk.X, padx=5, pady=5)
+        
+        ttk.Radiobutton(f_epi, text="Ignore (Fast)", variable=self.mpcp_row_mode, value=0).pack(side=tk.LEFT, padx=5)
+        ttk.Radiobutton(f_epi, text="Epipolar Filter", variable=self.mpcp_row_mode, value=1).pack(side=tk.LEFT, padx=5)
+        ttk.Radiobutton(f_epi, text="Merge Col+Row", variable=self.mpcp_row_mode, value=2).pack(side=tk.LEFT, padx=5)
+        
+        ttk.Label(f_epi, text=" |  Filter Tol (mm):").pack(side=tk.LEFT, padx=(5, 2))
+        ttk.Spinbox(
+            f_epi, textvariable=self.mpcp_epipolar_tol, from_=0.1, to=50.0, increment=0.1,
+            width=6, justify="center"
+        ).pack(side=tk.LEFT, padx=2)
+
+        # ── 5. Image Masking Thresholds ──────────────────────────────────
+        lf_thresh = ttk.LabelFrame(root, text="5. Image Masking Thresholds")
+        lf_thresh.pack(fill=tk.X, padx=10, pady=6)
+        
+        f_thresh = ttk.Frame(lf_thresh)
+        f_thresh.pack(fill=tk.X, padx=5, pady=5)
+        
+        def _toggle_manual_thresholds(*_):
+            state = "normal" if self.mpcp_thresh_mode.get() == "manual" else "disabled"
+            sb_shadow.config(state=state)
+            sb_contrast.config(state=state)
+            
+        ttk.Radiobutton(f_thresh, text="Otsu Auto (Recommended)", variable=self.mpcp_thresh_mode, value="otsu", command=_toggle_manual_thresholds).pack(side=tk.LEFT, padx=5)
+        ttk.Radiobutton(f_thresh, text="Manual", variable=self.mpcp_thresh_mode, value="manual", command=_toggle_manual_thresholds).pack(side=tk.LEFT, padx=5)
+        
+        ttk.Label(f_thresh, text=" | Shadow (>):").pack(side=tk.LEFT, padx=(5, 2))
+        sb_shadow = ttk.Spinbox(
+            f_thresh, textvariable=self.mpcp_shadow_val, from_=0, to=255, increment=1,
+            width=4, justify="center", state="disabled"
+        )
+        sb_shadow.pack(side=tk.LEFT, padx=2)
+        
+        ttk.Label(f_thresh, text="Contrast (>):").pack(side=tk.LEFT, padx=(10, 2))
+        sb_contrast = ttk.Spinbox(
+            f_thresh, textvariable=self.mpcp_contrast_val, from_=0, to=255, increment=1,
+            width=4, justify="center", state="disabled"
+        )
+        sb_contrast.pack(side=tk.LEFT, padx=2)
+
+        # ── 6. Run ────────────────────────────────────────────────────────
+        self.btn_run_mpcp = ttk.Button(
+            root, text="▶  START GENERATING PLY", command=self.do_multi_pcp)
+        self.btn_run_mpcp.pack(fill=tk.X, padx=20, pady=12)
+
+        # ── 7. Log ────────────────────────────────────────────────────────
+        lf4 = ttk.LabelFrame(root, text="Processing Log")
+        lf4.pack(fill=tk.BOTH, expand=True, padx=10, pady=6)
+
+        self.txt_log_mpcp = tk.Text(lf4, state="disabled", height=10,
+                                    wrap="word", font=("Consolas", 9))
+        sb2 = ttk.Scrollbar(lf4, orient="vertical",
+                             command=self.txt_log_mpcp.yview)
+        self.txt_log_mpcp.configure(yscrollcommand=sb2.set)
+        sb2.pack(side=tk.RIGHT, fill=tk.Y)
+        self.txt_log_mpcp.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+
+    # -- helpers for multiPCP tab --
+    def _mpcp_on_mode(self):
+        if self.mpcp_mode.get() == "files":
+            self._mpcp_frame_folder.pack_forget()
+            self._mpcp_frame_files.pack(fill=tk.X, padx=5, pady=2)
+        else:
+            self._mpcp_frame_files.pack_forget()
+            self._mpcp_frame_folder.pack(fill=tk.X, padx=5, pady=2)
+
+    def _mpcp_sel_files(self):
+        files = filedialog.askopenfilenames(
+            title="Select structured-light images (sorted order)",
+            filetypes=[("Image files", "*.bmp *.png *.jpg"), ("All", "*.*")]
+        )
+        if files:
+            self.mpcp_selected_files = sorted(list(files))
+            self._mpcp_lbl_files.config(
+                text=f"{len(self.mpcp_selected_files)} file(s) selected")
+            self.mpcp_log(f"Selected {len(self.mpcp_selected_files)} files.")
+
+    def _mpcp_clamp(self, var, lo, hi):
+        try:  v = int(var.get())
+        except ValueError: v = lo
+        var.set(str(max(lo, min(hi, v))))
+
+    def _mpcp_step(self, var, lo, hi, delta):
+        try:  v = int(var.get())
+        except ValueError: v = lo
+        var.set(str(max(lo, min(hi, v + delta))))
+
+    def _mpcp_preset(self, n):
+        self.mpcp_col_sets.set(str(n))
+        self.mpcp_row_sets.set(str(n))
     def setup_scan_tab(self):
         # Main screen for Scanning, Calibration, and Point Cloud generation
         root = self.tab_scan
@@ -1070,31 +1262,130 @@ class ScannerGUI:
 
 
     def do_multi_pcp(self):
-        calib = self.mpcp_calib_file.get()
-        target = self.mpcp_input_path.get()
-        mode = self.mpcp_mode.get()
-        
-        if not calib or not target:
-            messagebox.showerror("Error", "Please select both a calibration file and an input folder.")
+        calib  = self.mpcp_calib_file.get().strip()
+        mode   = self.mpcp_mode.get()       # 'single' | 'batch' | 'files'
+        is_bat = self.mpcp_batch.get()
+
+        # Determine effective folder mode
+        folder_mode = "batch" if (mode == "single" and is_bat) else mode
+        if mode == "single" and not is_bat:
+            folder_mode = "single"
+
+        # Validate calibration
+        if not calib:
+            messagebox.showerror("Error", "Please select a calibration file.")
             return
-            
         if not os.path.exists(calib):
             messagebox.showerror("Error", "Calibration file not found.")
             return
 
-        self.btn_run_mpcp.config(state='disabled')
-        self.mpcp_log(f"=== Starting {mode.upper()} Processing ===")
-        
+        # Validate pattern-set count
+        try:
+            n_col = int(self.mpcp_col_sets.get())
+            n_row = int(self.mpcp_row_sets.get())
+        except ValueError:
+            messagebox.showerror("Error", "Invalid pattern count values.")
+            return
+        if not (1 <= n_col <= 11) or not (1 <= n_row <= 11):
+            messagebox.showerror("Error", "Pattern count must be between 1 and 11.")
+            return
+
+        # Validate Row Mode / Epipolar
+        row_mode = self.mpcp_row_mode.get()
+        ep_tol = 2.0
+        if row_mode == 1:
+            try:
+                ep_tol = float(self.mpcp_epipolar_tol.get())
+            except ValueError:
+                messagebox.showerror("Error", "Invalid epipolar tolerance value.")
+                return
+
+        # Validate Thresholds
+        thresh_mode = self.mpcp_thresh_mode.get()
+        s_val, c_val = 40, 10
+        if thresh_mode == "manual":
+            try:
+                s_val = int(self.mpcp_shadow_val.get())
+                c_val = int(self.mpcp_contrast_val.get())
+            except ValueError:
+                messagebox.showerror("Error", "Invalid threshold values.")
+                return
+
+        # Validate input source
+        if mode == "files":
+            if not self.mpcp_selected_files:
+                messagebox.showerror("Error", "Please select image files first.")
+                return
+            target = ""  # not used in file-list mode
+        else:
+            target = self.mpcp_input_path.get().strip()
+            if not target:
+                messagebox.showerror("Error", "Please select an input folder.")
+                return
+            if not os.path.isdir(target):
+                messagebox.showerror("Error", "Input folder not found.")
+                return
+
+        self.btn_run_mpcp.config(state="disabled")
+        self.mpcp_log(
+            f"=== Starting Processing  "
+            f"[col-sets={n_col}  row-sets={n_row}] ==="
+        )
+
         def run():
             try:
-                self.processor.process_multi_ply(calib, target, mode, log_callback=self.mpcp_log)
-                self.root.after(0, lambda: messagebox.showinfo("Done", "Processing Completed!"))
+                if mode == "files":
+                    # Ask where to save the output PLY on the main thread, then decode
+                    out_path_holder = [None]
+
+                    def _ask_save():
+                        p = filedialog.asksaveasfilename(
+                            title="Save PLY as",
+                            defaultextension=".ply",
+                            filetypes=[("PLY files", "*.ply")]
+                        )
+                        out_path_holder[0] = p
+                        save_event.set()
+
+                    import threading as _t
+                    save_event = _t.Event()
+                    self.root.after(0, _ask_save)
+                    save_event.wait(timeout=120)
+
+                    out_path = out_path_holder[0]
+                    if not out_path:
+                        self.mpcp_log("Save cancelled.")
+                        return
+
+                    self.processor.process_multi_ply(
+                        calib, "", "files",
+                        log_callback=self.mpcp_log,
+                        n_sets_col=n_col, n_sets_row=n_row,
+                        row_mode=row_mode, epipolar_tol=ep_tol,
+                        thresh_mode=thresh_mode, shadow_val=s_val, contrast_val=c_val,
+                        file_list=self.mpcp_selected_files,
+                        out_path_override=out_path
+                    )
+                else:
+                    self.processor.process_multi_ply(
+                        calib, target, folder_mode,
+                        log_callback=self.mpcp_log,
+                        n_sets_col=n_col, n_sets_row=n_row,
+                        row_mode=row_mode, epipolar_tol=ep_tol,
+                        thresh_mode=thresh_mode, shadow_val=s_val, contrast_val=c_val
+                    )
+
+                self.root.after(
+                    0, lambda: messagebox.showinfo("Done", "Processing complete!"))
+
             except Exception as e:
                 self.mpcp_log(f"CRITICAL ERROR: {e}")
-                self.root.after(0, lambda: messagebox.showerror("Error", str(e)))
+                self.root.after(
+                    0, lambda: messagebox.showerror("Error", str(e)))
             finally:
-                self.root.after(0, lambda: self.btn_run_mpcp.config(state='normal'))
-                
+                self.root.after(
+                    0, lambda: self.btn_run_mpcp.config(state="normal"))
+
         threading.Thread(target=run, daemon=True).start()
 
     def do_batch_processing(self):

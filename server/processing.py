@@ -25,59 +25,107 @@ class ProcessingLogic:
 
     # --- Multi PLY Processing Functions ---
     @staticmethod
-    def _gray_decode(folder, n_cols=1920, n_rows=1080):
-        # Decode the black and white stripe images (Gray Code)
-        files = sorted(glob.glob(os.path.join(folder, "*.bmp")))
-        if not files:
-            files = sorted(glob.glob(os.path.join(folder, "*.png")))
-            
+    def _gray_decode(source, n_cols=1920, n_rows=1080,
+                     n_sets_col=11, n_sets_row=11,
+                     thresh_mode='otsu', shadow_val=40, contrast_val=10):
+        """
+        Decode Gray-code structured-light images.
+
+        Parameters
+        ----------
+        source      : str (folder path) OR list[str] (sorted file list)
+        n_cols      : projector width  (pixels)
+        n_rows      : projector height (pixels)
+        n_sets_col  : how many FIRST column bit-planes to use (1-11, default 11)
+        n_sets_row  : how many FIRST row    bit-planes to use (1-11, default 11)
+        thresh_mode : 'otsu' or 'manual'
+        shadow_val  : manual shadow threshold (0-255)
+        contrast_val: manual contrast threshold (0-255)
+
+        Using fewer patterns skips the finest stripes and gives a coarser but
+        geometrically CORRECT result because the decoded values are scaled back
+        to the full projector coordinate range automatically.
+        """
+        if isinstance(source, list):
+            files = source
+        else:
+            files = sorted(glob.glob(os.path.join(source, "*.bmp")))
+            if not files:
+                files = sorted(glob.glob(os.path.join(source, "*.png")))
+
         if len(files) < 4:
-            raise ValueError(f"Not enough images in {folder} to decode.")
+            raise ValueError(f"Not enough images (got {len(files)}, need at least 4).")
 
         img_white = cv2.imread(files[0], 0).astype(np.float32)
         img_black = cv2.imread(files[1], 0).astype(np.float32)
-        
         height, width = img_white.shape
-        
-        mask_shadow = img_white > 40
-        mask_contrast = (img_white - img_black) > 10
+
+        if thresh_mode == 'otsu':
+            # Auto-calculate optimal threshold using Otsu's method
+            # Must convert to uint8 for cv2.threshold
+            img_uint8 = img_white.astype(np.uint8)
+            otsu_s_val, _ = cv2.threshold(img_uint8, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+            mask_shadow = img_white > otsu_s_val
+            
+            diff_img = np.clip(img_white - img_black, 0, 255).astype(np.uint8)
+            otsu_c_val, _ = cv2.threshold(diff_img, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+            mask_contrast = (img_white - img_black) > otsu_c_val
+        else:
+            # Manual thresholds
+            mask_shadow   = img_white > shadow_val
+            mask_contrast = (img_white - img_black) > contrast_val
+
         valid_mask = mask_shadow & mask_contrast
 
-        n_col_bits = int(np.ceil(np.log2(n_cols)))
-        n_row_bits = int(np.ceil(np.log2(n_rows)))
-        
+        max_col_bits = int(np.ceil(np.log2(n_cols)))  # 11 for 1920
+        max_row_bits = int(np.ceil(np.log2(n_rows)))  # 11 for 1080
+
+        n_use_col = max(1, min(int(n_sets_col), max_col_bits))
+        n_use_row = max(1, min(int(n_sets_row), max_row_bits))
+
         current_idx = 2
-        
-        def decode_sequence(n_bits):
+
+        def decode_first_n(max_bits, n_use):
+            """Read ALL max_bits pairs but only decode the first n_use.
+            The decoded value is in [0, 2^n_use - 1]."""
             nonlocal current_idx
             gray_val = np.zeros((height, width), dtype=np.int32)
-            
-            for b in range(n_bits):
-                if current_idx >= len(files): break
-                p_path = files[current_idx]; current_idx += 1
-                i_path = files[current_idx]; current_idx += 1
-                
-                img_p = cv2.imread(p_path, 0).astype(np.float32)
-                img_i = cv2.imread(i_path, 0).astype(np.float32)
-                
-                bit = np.zeros((height, width), dtype=np.int32)
-                bit[img_p > img_i] = 1
-                gray_val = np.bitwise_or(gray_val, np.left_shift(bit, (n_bits - 1 - b)))
-
+            for b in range(max_bits):
+                if current_idx + 1 >= len(files):
+                    current_idx += 2
+                    continue
+                if b < n_use:
+                    img_p = cv2.imread(files[current_idx],     0).astype(np.float32)
+                    img_i = cv2.imread(files[current_idx + 1], 0).astype(np.float32)
+                    bit = np.zeros((height, width), dtype=np.int32)
+                    bit[img_p > img_i] = 1
+                    # bit 0 = MSB of n_use-bit number
+                    gray_val = np.bitwise_or(gray_val,
+                                             np.left_shift(bit, (n_use - 1 - b)))
+                current_idx += 2  # always advance pointer
+            # Gray -> binary
             mask = np.right_shift(gray_val, 1)
             while np.any(mask > 0):
                 gray_val = np.bitwise_xor(gray_val, mask)
                 mask = np.right_shift(mask, 1)
-                
             return gray_val
 
-        col_map = decode_sequence(n_col_bits)
-        row_map = decode_sequence(n_row_bits)
-        
+        col_map = decode_first_n(max_col_bits, n_use_col)
+        row_map = decode_first_n(max_row_bits, n_use_row)
+
+        # CRITICAL: scale decoded values back to the full projector coordinate
+        # range so that wPlaneCol/wPlaneRow lookups remain geometrically correct.
+        # Example: 9 bits gives values 0-511 -> *4 -> 0-2044 (covers 1920 cols).
+        col_scale = 1 << (max_col_bits - n_use_col)  # 2^(11-n_use_col)
+        row_scale = 1 << (max_row_bits - n_use_row)
+        col_map = col_map * col_scale
+        row_map = row_map * row_scale
+
         return col_map, row_map, valid_mask, cv2.imread(files[0])
 
     @staticmethod
-    def _reconstruct_point_cloud(col_map, row_map, mask, texture, calib):
+    def _reconstruct_point_cloud(col_map, row_map, mask, texture, calib,
+                                 row_mode=1, epipolar_tol=2.0):
         # Calculate the intersection to find the 3D position (Triangulation)
         Nc = calib["Nc"]
         Oc = calib["Oc"]
@@ -110,21 +158,80 @@ class ProcessingLogic:
         proj_cols = col_flat[valid_indices]
         proj_cols = np.clip(proj_cols, 0, wPlaneCol.shape[0] - 1)
         
-        planes = wPlaneCol[proj_cols, :]
-        N = planes[:, 0:3].T
-        d = planes[:, 3]
+        planes_col = wPlaneCol[proj_cols, :]
+        N_col = planes_col[:, 0:3].T
+        d_col = planes_col[:, 3]
         
-        denom = np.sum(N * rays, axis=0)
-        numer = np.dot(N.T, Oc).flatten() + d
+        denom_col = np.sum(N_col * rays, axis=0)
+        numer_col = np.dot(N_col.T, Oc).flatten() + d_col
         
-        valid_intersect = np.abs(denom) > 1e-6
-        t = -numer[valid_intersect] / denom[valid_intersect]
+        valid_intersect_col = np.abs(denom_col) > 1e-6
         
-        rays_valid = rays[:, valid_intersect]
-        P = Oc + rays_valid * t
-        C = tex_flat[valid_indices[valid_intersect]]
+        # Avoid divide by zero by safely calculating t_col
+        t_col = np.zeros_like(denom_col)
+        t_col[valid_intersect_col] = -numer_col[valid_intersect_col] / denom_col[valid_intersect_col]
         
-        return P.T, C
+        if row_mode == 0:
+            # Mode 0: Ignore Rows
+            valid_final = valid_intersect_col
+            t_final = t_col[valid_final]
+            
+            rays_valid = rays[:, valid_final]
+            P = Oc + rays_valid * t_final
+            C = tex_flat[valid_indices[valid_final]]
+            return P.T, C
+            
+        # Mode 1 & 2 both need the row planes
+        wPlaneRow = calib["wPlaneRow"]
+        if wPlaneRow.shape[0] == 4: wPlaneRow = wPlaneRow.T
+        row_flat = row_map.flatten()
+        proj_rows = row_flat[valid_indices]
+        proj_rows = np.clip(proj_rows, 0, wPlaneRow.shape[0] - 1)
+        
+        planes_row = wPlaneRow[proj_rows, :]
+        N_row = planes_row[:, 0:3].T
+        d_row = planes_row[:, 3]
+
+        if row_mode == 1:
+            # Mode 1: Epipolar Filter
+            P_temp = Oc + rays * t_col
+            dist_to_row = np.abs(np.sum(N_row * P_temp, axis=0) + d_row)
+            valid_epipolar = dist_to_row < epipolar_tol
+            
+            valid_final = valid_intersect_col & valid_epipolar
+            t_final = t_col[valid_final]
+            
+            rays_valid = rays[:, valid_final]
+            P = Oc + rays_valid * t_final
+            C = tex_flat[valid_indices[valid_final]]
+            return P.T, C
+            
+        elif row_mode == 2:
+            # Mode 2: Merge Point Clouds
+            # Generate the column point cloud independently
+            rays_col = rays[:, valid_intersect_col]
+            t_col_valid = t_col[valid_intersect_col]
+            P_col = Oc + rays_col * t_col_valid
+            C_col = tex_flat[valid_indices[valid_intersect_col]]
+            
+            # Generate the row point cloud independently
+            denom_row = np.sum(N_row * rays, axis=0)
+            numer_row = np.dot(N_row.T, Oc).flatten() + d_row
+            valid_intersect_row = np.abs(denom_row) > 1e-6
+            
+            # Use safety buffer to prevent divide by zero
+            t_row = np.zeros_like(denom_row)
+            t_row[valid_intersect_row] = -numer_row[valid_intersect_row] / denom_row[valid_intersect_row]
+            
+            rays_row = rays[:, valid_intersect_row]
+            t_row_valid = t_row[valid_intersect_row]
+            P_row = Oc + rays_row * t_row_valid
+            C_row = tex_flat[valid_indices[valid_intersect_row]]
+            
+            # Merge both arrays
+            P_merged = np.hstack((P_col, P_row))
+            C_merged = np.vstack((C_col, C_row))
+            return P_merged.T, C_merged
 
     @staticmethod
     def _save_ply(points, colors, filename):
@@ -141,13 +248,33 @@ class ProcessingLogic:
                 f.write(f"{p[0]:.4f} {p[1]:.4f} {p[2]:.4f} {c[2]} {c[1]} {c[0]}\n")
 
     @staticmethod
-    def process_multi_ply(calib_path, target_path, mode, log_callback=None):
-        # Function to process and filter 3D data from raw images (Single or Batch)
-        # log_callback is a function to send messages back to print on the UI
+    def process_multi_ply(calib_path, target_path, mode, log_callback=None,
+                          n_sets_col=11, n_sets_row=11,
+                          row_mode=1, epipolar_tol=2.0,
+                          thresh_mode='otsu', shadow_val=40, contrast_val=10,
+                          file_list=None, out_path_override=None):
+        """
+        Process structured-light images → .ply point cloud.
+
+        Parameters
+        ----------
+        calib_path       : path to .mat calibration file
+        target_path      : folder to process (single scan folder or parent for batch)
+        mode             : 'single' | 'batch' | 'files'
+        log_callback     : optional callable(str) for UI log output
+        col_start        : first column bit-plane to use (0-indexed, inclusive)
+        col_end          : last  column bit-plane to use (0-indexed, inclusive)
+        row_start        : first row    bit-plane to use (0-indexed, inclusive)
+        row_end          : last  row    bit-plane to use (0-indexed, inclusive)
+        file_list        : sorted list of image paths – used when mode == 'files'
+        out_path_override: output .ply path – used when mode == 'files'
+        """
         def log(msg):
             if log_callback: log_callback(msg)
             else: print(msg)
-            
+
+        decode_kw = dict(n_sets_col=n_sets_col, n_sets_row=n_sets_row)
+
         log("Loading Calibration Data...")
         data = scipy.io.loadmat(calib_path)
         calib_data = {
@@ -155,39 +282,56 @@ class ProcessingLogic:
             "wPlaneCol": data["wPlaneCol"], "wPlaneRow": data["wPlaneRow"],
             "cam_K": data["cam_K"]
         }
-        
-        def process_single(scan_dir):
-            ply_name = os.path.basename(scan_dir) + ".ply"
-            out_path = os.path.join(scan_dir, ply_name)
-            
-            log(f"-> Decoding images in {os.path.basename(scan_dir)}...")
-            c_map, r_map, mask, texture = ProcessingLogic._gray_decode(scan_dir)
-            
-            log("-> Reconstructing 3D points...")
-            points, colors = ProcessingLogic._reconstruct_point_cloud(c_map, r_map, mask, texture, calib_data)
-            
-            log(f"-> Saving {len(points)} points...")
+
+        def _process_source(source, out_path, label):
+            log(f"  -> Decoding {label}  "
+                f"[col-sets={n_sets_col}  row-sets={n_sets_row}]...")
+            c_map, r_map, mask, texture = ProcessingLogic._gray_decode(
+                source, **decode_kw,
+                thresh_mode=thresh_mode, shadow_val=shadow_val, contrast_val=contrast_val)
+            log("  -> Reconstructing 3D points...")
+            points, colors = ProcessingLogic._reconstruct_point_cloud(
+                c_map, r_map, mask, texture, calib_data,
+                row_mode=row_mode, epipolar_tol=epipolar_tol)
+            log(f"  -> Saving {len(points)} points...")
             ProcessingLogic._save_ply(points, colors, out_path)
-            log(f"✔ Saved: {ply_name}\n")
-            
-        if mode == "single":
-            process_single(target_path)
-        else:
+            log(f"  ✔ Saved: {os.path.basename(out_path)}\n")
+
+        if mode == "files":
+            if not file_list:
+                raise ValueError("mode='files' requires a non-empty file_list.")
+            if not out_path_override:
+                raise ValueError("mode='files' requires out_path_override.")
+            _process_source(file_list, out_path_override,
+                            f"{len(file_list)} selected files")
+
+        elif mode == "single":
+            ply_name = os.path.basename(target_path) + ".ply"
+            out_path = os.path.join(target_path, ply_name)
+            _process_source(target_path, out_path,
+                            f"folder '{os.path.basename(target_path)}'")
+
+        else:  # batch
             subfolders = [f.path for f in os.scandir(target_path) if f.is_dir()]
             log(f"Found {len(subfolders)} subfolders to process.")
-            
+
             success_count = 0
             for folder in subfolders:
-                if glob.glob(os.path.join(folder, "*.bmp")) or glob.glob(os.path.join(folder, "*.png")):
+                has_imgs = (glob.glob(os.path.join(folder, "*.bmp")) or
+                            glob.glob(os.path.join(folder, "*.png")))
+                if has_imgs:
                     try:
-                        process_single(folder)
+                        ply_name = os.path.basename(folder) + ".ply"
+                        out_path = os.path.join(folder, ply_name)
+                        _process_source(folder, out_path,
+                                        f"folder '{os.path.basename(folder)}'")
                         success_count += 1
                     except Exception as e:
-                        log(f"❌ Error in {os.path.basename(folder)}: {e}\n")
+                        log(f"  ❌ Error in {os.path.basename(folder)}: {e}\n")
                 else:
-                    log(f"Skipping {os.path.basename(folder)} (No images found).")
-                    
-            log(f"=== Batch Complete: Successfully processed {success_count}/{len(subfolders)} folders ===")
+                    log(f"  Skipping {os.path.basename(folder)} (No images found).")
+
+            log(f"=== Batch Complete: {success_count}/{len(subfolders)} succeeded ===")
 
     @staticmethod
     def remove_background(input_data, output_path=None, distance_threshold=50, ransac_n=3, num_iterations=1000, return_obj=False):
