@@ -441,8 +441,8 @@ class SLSystem:
         white = np.ones((SCREEN_HEIGHT, SCREEN_WIDTH), dtype=np.uint8) * PROJ_VALUE # Full white image to capture texture layers 
         black = np.zeros((SCREEN_HEIGHT, SCREEN_WIDTH), dtype=np.uint8) # Full black image for ambient noise testing
         
-        patterns.append(("01.bmp", white))
-        patterns.append(("02.bmp", black))
+        patterns.append(("01.png", white))
+        patterns.append(("02.png", black))
         
         idx = 3 # Pattern images start at the 3rd image
         # Add striped images and Inverses into patterns list for projection
@@ -455,8 +455,8 @@ class SLSystem:
                     pat_img = cv2.resize(pat_img, (SCREEN_WIDTH, SCREEN_HEIGHT), interpolation=cv2.INTER_NEAREST)
                     inv_img = cv2.resize(inv_img, (SCREEN_WIDTH, SCREEN_HEIGHT), interpolation=cv2.INTER_NEAREST)
                     
-                patterns.append((f"{idx:02d}.bmp", pat_img)); idx+=1
-                patterns.append((f"{idx:02d}.bmp", inv_img)); idx+=1
+                patterns.append((f"{idx:02d}.png", pat_img)); idx+=1
+                patterns.append((f"{idx:02d}.png", inv_img)); idx+=1
         
         # Create folder for lossless .bmp image storage
         os.makedirs(save_dir, exist_ok=True)
@@ -514,10 +514,10 @@ class SLSystem:
         # Embed gray_decode exactly as it is in standalone
         # Function to Decode Gray coded patterns from the object
         def gray_decode(folder, n_cols=1920, n_rows=1080):
-            # Find all .bmp or .png images in scan directory
-            files = sorted(glob.glob(os.path.join(folder, "*.bmp")))
+            # Find all .png or .bmp images in scan directory
+            files = sorted(glob.glob(os.path.join(folder, "*.png")))
             if not files:
-                files = sorted(glob.glob(os.path.join(folder, "*.png")))
+                files = sorted(glob.glob(os.path.join(folder, "*.bmp")))
                 
             # Must contain sufficient files (>4), otherwise Error 
             if len(files) < 4:

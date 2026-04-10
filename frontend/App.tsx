@@ -235,7 +235,7 @@ export default function App() {
       if (!blob) { setStatus(ConnectionStatus.ERROR); return; }
       setLastPhoto(URL.createObjectURL(blob));
       const formData = new FormData();
-      formData.append('file', blob, 'capture.jpg');
+      formData.append('file', blob, 'capture.png');
       try {
         const res = await fetch(`${serverUrl}/upload`, { method: 'POST', body: formData, mode: 'cors' });
         if (res.ok) { addLog("Uploaded."); setStatus(ConnectionStatus.CONNECTED); } 
@@ -244,7 +244,7 @@ export default function App() {
         addLog(`Upload Err: ${err.message}`);
         setStatus(ConnectionStatus.ERROR);
       }
-    }, 'image/jpeg', 1.0); 
+    }, 'image/png'); 
   };
 
   const handleSaveSettings = () => {
@@ -426,8 +426,10 @@ export default function App() {
 
       {/* Trigger */}
       <div className="absolute bottom-6 left-0 right-0 flex justify-center pointer-events-none z-30">
-        <button onClick={handleCapture}
-          className="pointer-events-auto bg-red-600/90 hover:bg-red-500 text-white w-20 h-20 rounded-full flex items-center justify-center shadow-lg border-4 border-white/20 ring-2 ring-red-600 transition-transform active:scale-95">
+        <button 
+          onClick={handleCapture}
+          disabled={status === ConnectionStatus.UPLOADING || status === ConnectionStatus.CAPTURING}
+          className={`pointer-events-auto bg-red-600/90 text-white w-20 h-20 rounded-full flex items-center justify-center shadow-lg border-4 border-white/20 ring-2 ring-red-600 transition-transform ${status === ConnectionStatus.UPLOADING || status === ConnectionStatus.CAPTURING ? 'opacity-50 cursor-not-allowed' : 'hover:bg-red-500 active:scale-95'}`}>
           <div className="w-16 h-16 rounded-full border-2 border-white/40" />
         </button>
       </div>

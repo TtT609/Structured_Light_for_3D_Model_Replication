@@ -400,7 +400,7 @@ class ScannerGUI:
     def _mpcp_sel_files(self):
         files = filedialog.askopenfilenames(
             title="Select structured-light images (sorted order)",
-            filetypes=[("Image files", "*.bmp *.png *.jpg"), ("All", "*.*")]
+            filetypes=[("Image files", "*.png *.bmp"), ("All", "*.*")]
         )
         if files:
             self.mpcp_selected_files = sorted(list(files))

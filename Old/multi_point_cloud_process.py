@@ -49,9 +49,9 @@ def gray_decode(source, n_sets_col=11, n_sets_row=11, n_cols=1920, n_rows=1080,
     if isinstance(source, list):
         files = source                          # already a sorted list
     else:
-        files = sorted(glob.glob(os.path.join(source, "*.bmp")))
+        files = sorted(glob.glob(os.path.join(source, "*.png")))
         if not files:
-            files = sorted(glob.glob(os.path.join(source, "*.png")))
+            files = sorted(glob.glob(os.path.join(source, "*.bmp")))
 
     if len(files) < 4:
         raise ValueError(f"Not enough images (got {len(files)}, need at least 4).")
@@ -513,7 +513,7 @@ class BatchCloudApp:
     def sel_input_files(self):
         files = filedialog.askopenfilenames(
             title="Select structured-light images (sorted order)",
-            filetypes=[("Image files", "*.bmp *.png *.jpg *.jpeg"), ("All files", "*.*")]
+            filetypes=[("Image files", "*.png *.bmp"), ("All files", "*.*")]
         )
         if files:
             self.selected_files = sorted(list(files))
