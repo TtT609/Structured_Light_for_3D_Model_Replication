@@ -65,14 +65,14 @@ class ProcessingLogic:
             # Must convert to uint8 for cv2.threshold
             img_uint8 = img_white.astype(np.uint8)
             otsu_s_val, _ = cv2.threshold(img_uint8, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
-            mask_shadow = img_white > otsu_s_val
+            mask_shadow = (img_white > otsu_s_val) & (img_white < 250)
             
             diff_img = np.clip(img_white - img_black, 0, 255).astype(np.uint8)
             otsu_c_val, _ = cv2.threshold(diff_img, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
             mask_contrast = (img_white - img_black) > otsu_c_val
         else:
             # Manual thresholds
-            mask_shadow   = img_white > shadow_val
+            mask_shadow   = (img_white > shadow_val) & (img_white < 250)
             mask_contrast = (img_white - img_black) > contrast_val
 
         valid_mask = mask_shadow & mask_contrast
@@ -98,7 +98,9 @@ class ProcessingLogic:
                     img_p = cv2.imread(files[current_idx],     0).astype(np.float32)
                     img_i = cv2.imread(files[current_idx + 1], 0).astype(np.float32)
                     bit = np.zeros((height, width), dtype=np.int32)
-                    bit[img_p > img_i] = 1
+                    modulation = img_white - img_black
+                    normalized_diff = (img_p - img_i) / (modulation + 1e-6)
+                    bit[normalized_diff > 0.0] = 1
                     # bit 0 = MSB of n_use-bit number
                     gray_val = np.bitwise_or(gray_val,
                                              np.left_shift(bit, (n_use - 1 - b)))
@@ -125,7 +127,7 @@ class ProcessingLogic:
 
     @staticmethod
     def _reconstruct_point_cloud(col_map, row_map, mask, texture, calib,
-                                 row_mode=1, epipolar_tol=2.0):
+                                 row_mode=1, epipolar_tol=0.5):
         # Calculate the intersection to find the 3D position (Triangulation)
         Nc = calib["Nc"]
         Oc = calib["Oc"]
@@ -250,7 +252,7 @@ class ProcessingLogic:
     @staticmethod
     def process_multi_ply(calib_path, target_path, mode, log_callback=None,
                           n_sets_col=11, n_sets_row=11,
-                          row_mode=1, epipolar_tol=2.0,
+                          row_mode=1, epipolar_tol=0.5,
                           thresh_mode='otsu', shadow_val=40, contrast_val=10,
                           file_list=None, out_path_override=None):
         """

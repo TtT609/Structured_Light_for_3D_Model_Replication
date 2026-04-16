@@ -55,7 +55,7 @@ class ScannerGUI:
         
         # Row Processing Mode
         self.mpcp_row_mode = tk.IntVar(value=1) # 0=None, 1=Epipolar, 2=Merge
-        self.mpcp_epipolar_tol = tk.StringVar(value="2.0")
+        self.mpcp_epipolar_tol = tk.StringVar(value="0.5")
 
         # Thresholds
         self.mpcp_thresh_mode = tk.StringVar(value="otsu") # otsu or manual
@@ -86,8 +86,8 @@ class ScannerGUI:
         self.bg_iterations = tk.IntVar(value=1000) # RANSAC iterations
         
         # Statistical Outlier Params
-        self.proc_nb_neighbors = tk.IntVar(value=20)   # Number of neighbors for distance calculation
-        self.proc_std_ratio = tk.DoubleVar(value=2.0)  # Standard deviation ratio for outlier threshold
+        self.proc_nb_neighbors = tk.IntVar(value=30)   # Number of neighbors for distance calculation
+        self.proc_std_ratio = tk.DoubleVar(value=1.5)  # Standard deviation ratio for outlier threshold
         
         # Radius Outlier Params
         self.proc_radius_nb = tk.IntVar(value=100)
@@ -167,6 +167,9 @@ class ScannerGUI:
 
         # --- State Variables (Calib Check) ---
         self.chk_calib_file = tk.StringVar(value=os.path.join(DEFAULT_ROOT, "calib", "calib.mat"))
+
+        # --- Camera Mode (Web Frontend vs Android Native) ---
+        self.camera_mode = tk.StringVar(value="web")  # 'web' or 'android'
 
         # --- TABS (Setting up program tab sheets) ---
         self.notebook = ttk.Notebook(root) # Create horizontal tab menu
@@ -433,6 +436,32 @@ class ScannerGUI:
         # Pull LAN IP to display for phone connection
         self.update_ip()
         
+        # --- Camera Mode Selector ---
+        lf_cam_mode = ttk.LabelFrame(root, text="📷  Camera Mode")
+        lf_cam_mode.pack(fill=tk.X, padx=10, pady=(5, 8))
+
+        f_cam_radio = ttk.Frame(lf_cam_mode); f_cam_radio.pack(fill=tk.X, padx=8, pady=(6, 2))
+        ttk.Radiobutton(
+            f_cam_radio, text="Web Frontend  (browser, ~8MP, no app needed)",
+            variable=self.camera_mode, value="web",
+            command=self._update_cam_mode_label
+        ).pack(side=tk.LEFT, padx=4)
+        ttk.Radiobutton(
+            f_cam_radio, text="Android Native App  (Camera2 API, full sensor — up to 50MP)",
+            variable=self.camera_mode, value="android",
+            command=self._update_cam_mode_label
+        ).pack(side=tk.LEFT, padx=4)
+
+        self.cam_mode_lbl = ttk.Label(
+            lf_cam_mode,
+            text="",
+            foreground="#0066CC",
+            font=("Arial", 9, "italic"),
+            justify=tk.LEFT,
+        )
+        self.cam_mode_lbl.pack(anchor=tk.W, padx=10, pady=(2, 6))
+        self._update_cam_mode_label()   # set initial label text
+
         # --- Frame STEP 1: Calibrate Capture ---
         lf1 = ttk.LabelFrame(root, text="1. Calibration Capture")
         lf1.pack(fill=tk.X, padx=10, pady=5)
@@ -1123,9 +1152,34 @@ class ScannerGUI:
         import socket
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.connect(("8.8.8.8", 80))
-            ip = s.getsockname()[0]; s.close() # Dig up IP
-            self.ip_lbl.config(text=f"Connect Phone to: http://{ip}:5000") # Display on screen
-        except: pass
+            self._pc_ip = s.getsockname()[0]; s.close() # Dig up IP
+            self.ip_lbl.config(text=f"Connect Phone to: http://{self._pc_ip}:5000") # Display on screen
+            self._update_cam_mode_label()  # Refresh mode label with real IP
+        except:
+            self._pc_ip = None
+
+    def _update_cam_mode_label(self):
+        """Update the hint label inside the Camera Mode frame to show instructions for the selected mode."""
+        mode = self.camera_mode.get()
+        ip = getattr(self, "_pc_ip", None)
+        url = f"http://{ip}:5000" if ip else "http://<PC-IP>:5000"
+        if mode == "web":
+            msg = (
+                f"Open a browser on your phone and navigate to  {url}\n"
+                "Images are captured via the browser MediaStream API (~8MP, PNG)."
+            )
+        else:
+            msg = (
+                f"📱  Open the 'SL Camera' app on your Android phone.\n"
+                f"➜  In  Settings  type:  {url}   then tap  Save & Close.\n"
+                "Images are captured via Camera2 API at full native resolution (PNG, lossless).\n"
+                "⚠  After first switch to Android mode, redo Calibration (Step 1 + 2) once."
+            )
+        try:
+            self.cam_mode_lbl.config(text=msg)
+        except Exception:
+            pass   # Called before widget exists (first __init__ pass) — safe to ignore
+
 
     def refresh_ports(self):
         # Pull COM 1 COM 2 into the Dropdown for the Turntable
@@ -1404,18 +1458,17 @@ class ScannerGUI:
             filename = os.path.basename(path)
             current_data = path  # Start with the raw file path; each step may return an object
 
-            # 1. Background Removal (Plane Segmentation)
-            if self.enable_bg_removal.get():
+            # 1. Statistical Outlier Removal
+            if self.enable_outlier_removal.get():
                 try:
-                    current_data = self.processor.remove_background(
+                    current_data = self.processor.remove_outliers(
                         input_data=current_data, output_path=None,
-                        distance_threshold=self.bg_dist_thresh.get(),
-                        ransac_n=self.bg_ransac_n.get(),
-                        num_iterations=self.bg_iterations.get(),
+                        nb_neighbors=self.proc_nb_neighbors.get(),
+                        std_ratio=self.proc_std_ratio.get(),
                         return_obj=True
                     )
                 except Exception as e:
-                    print(f"[BG] Error on {filename}: {e}")
+                    print(f"[StatOutlier] Error on {filename}: {e}")
                     return False
 
             # 2. Keep Largest Cluster (DBSCAN)
@@ -1444,17 +1497,18 @@ class ScannerGUI:
                     print(f"[RadOutlier] Error on {filename}: {e}")
                     return False
 
-            # 4. Statistical Outlier Removal
-            if self.enable_outlier_removal.get():
+            # 4. Background Removal (Plane Segmentation)
+            if self.enable_bg_removal.get():
                 try:
-                    current_data = self.processor.remove_outliers(
+                    current_data = self.processor.remove_background(
                         input_data=current_data, output_path=None,
-                        nb_neighbors=self.proc_nb_neighbors.get(),
-                        std_ratio=self.proc_std_ratio.get(),
+                        distance_threshold=self.bg_dist_thresh.get(),
+                        ransac_n=self.bg_ransac_n.get(),
+                        num_iterations=self.bg_iterations.get(),
                         return_obj=True
                     )
                 except Exception as e:
-                    print(f"[StatOutlier] Error on {filename}: {e}")
+                    print(f"[BG] Error on {filename}: {e}")
                     return False
 
             # Save the result
