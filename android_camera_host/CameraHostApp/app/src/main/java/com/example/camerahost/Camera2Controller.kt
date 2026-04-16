@@ -7,6 +7,8 @@ import android.graphics.BitmapFactory
 import android.graphics.ImageFormat
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.*
+import android.hardware.camera2.params.OutputConfiguration
+import android.hardware.camera2.params.SessionConfiguration
 import android.media.ImageReader
 import android.os.Handler
 import android.os.HandlerThread
@@ -16,6 +18,7 @@ import android.view.Surface
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executor
 import java.util.concurrent.TimeUnit
 
 /**
@@ -43,6 +46,9 @@ class Camera2Controller(private val context: Context) {
 
     private var activeCameraId: String? = null
 
+    // Track whether this camera supports ultra-high-resolution mode
+    private var supportsMaxRes = false
+
     // Manual camera settings (null = use auto)
     var manualIso: Int? = null
     var manualExposureTimeNs: Long? = null
@@ -69,7 +75,7 @@ class Camera2Controller(private val context: Context) {
 
     /**
      * Returns a human-readable label for the camera.
-     * On devices like S25, the label helps identify 50MP main vs ultra-wide.
+     * Shows both the standard (binned) and max-resolution (unbinned) sizes.
      */
     fun getCameraLabel(id: String): String {
         val cc = cameraManager.getCameraCharacteristics(id)
@@ -79,9 +85,31 @@ class Camera2Controller(private val context: Context) {
             CameraCharacteristics.LENS_FACING_FRONT -> "Front"
             else -> "External"
         }
-        val maxSize = getMaxJpegSize(id)
-        val mp = (maxSize.width.toLong() * maxSize.height.toLong()) / 1_000_000L
-        return "[$id] $facingStr ${maxSize.width}×${maxSize.height} (~${mp}MP)"
+
+        // Standard (binned) resolution
+        val stdCfg = cc.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+        val stdSizes = stdCfg?.getOutputSizes(ImageFormat.JPEG)?.toList()
+        val stdMax = stdSizes?.maxByOrNull { it.width.toLong() * it.height.toLong() }
+        val stdMp = if (stdMax != null) (stdMax.width.toLong() * stdMax.height.toLong()) / 1_000_000L else 0L
+
+        // Max-resolution (unbinned — 50MP+) on Android 12+
+        var maxResMp = 0L
+        var maxResSize: Size? = null
+        if (android.os.Build.VERSION.SDK_INT >= 31) {
+            val maxMap = cc.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP_MAXIMUM_RESOLUTION)
+            val maxSizes = maxMap?.getOutputSizes(ImageFormat.JPEG)?.toList()
+            maxResSize = maxSizes?.maxByOrNull { it.width.toLong() * it.height.toLong() }
+            if (maxResSize != null) {
+                maxResMp = (maxResSize.width.toLong() * maxResSize.height.toLong()) / 1_000_000L
+            }
+        }
+
+        // Build label: show capture MP (whichever is larger)
+        val captureSize = if (maxResMp > stdMp && maxResSize != null) maxResSize else stdMax
+        val captureMp = if (maxResMp > stdMp) maxResMp else stdMp
+        val dims = if (captureSize != null) "${captureSize.width}x${captureSize.height}" else "?"
+        val suffix = if (maxResMp > stdMp) " [MAX-RES]" else ""
+        return "[$id] $facingStr - ${captureMp}MP ($dims)$suffix"
     }
 
     /** Returns ISO range for this camera, or null if unavailable. */
@@ -108,6 +136,31 @@ class Camera2Controller(private val context: Context) {
 
         thread = HandlerThread("cam2-$cameraId").also { it.start() }
         handler = Handler(thread!!.looper)
+
+        // Check if this camera supports ultra-high-resolution mode
+        supportsMaxRes = false
+        if (android.os.Build.VERSION.SDK_INT >= 31) {
+            val cc = cameraManager.getCameraCharacteristics(cameraId)
+            val caps = cc.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
+            if (caps != null) {
+                supportsMaxRes = caps.contains(
+                    CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_ULTRA_HIGH_RESOLUTION_SENSOR
+                )
+            }
+            // Also check if MAXIMUM_RESOLUTION map has bigger sizes even without the capability flag
+            if (!supportsMaxRes) {
+                val maxMap = cc.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP_MAXIMUM_RESOLUTION)
+                val stdMap = cc.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+                val maxSizes = maxMap?.getOutputSizes(ImageFormat.JPEG)
+                val stdSizes = stdMap?.getOutputSizes(ImageFormat.JPEG)
+                if (maxSizes != null && stdSizes != null) {
+                    val maxPixels = maxSizes.maxOfOrNull { it.width.toLong() * it.height.toLong() } ?: 0
+                    val stdPixels = stdSizes.maxOfOrNull { it.width.toLong() * it.height.toLong() } ?: 0
+                    supportsMaxRes = maxPixels > stdPixels
+                }
+            }
+        }
+        Log.i(tag, "Camera $cameraId supportsMaxRes=$supportsMaxRes")
 
         val latch = CountDownLatch(1)
         var openErr: Exception? = null
@@ -141,6 +194,7 @@ class Camera2Controller(private val context: Context) {
     // -----------------------------------------------------------------------
 
     /** Start live preview rendering into the given SurfaceTexture. */
+    @SuppressLint("NewApi")
     fun startPreview(surfaceTexture: SurfaceTexture) {
         val cam = cameraDevice ?: throw RuntimeException("Camera not open")
         val cameraId = activeCameraId ?: throw RuntimeException("No active camera")
@@ -151,15 +205,15 @@ class Camera2Controller(private val context: Context) {
 
         // Create the still-capture ImageReader at MAXIMUM sensor resolution
         val maxSize = getMaxJpegSize(cameraId)
+        Log.i(tag, "ImageReader size: ${maxSize.width}x${maxSize.height} (${maxSize.width.toLong() * maxSize.height.toLong() / 1_000_000}MP)")
         imageReader = ImageReader.newInstance(maxSize.width, maxSize.height, ImageFormat.JPEG, 2)
 
         previewSurface = Surface(surfaceTexture)
-        val surfaces = listOf(previewSurface!!, imageReader!!.surface)
 
         val sessionLatch = CountDownLatch(1)
         var sessErr: Exception? = null
 
-        cam.createCaptureSession(surfaces, object : CameraCaptureSession.StateCallback() {
+        val stateCallback = object : CameraCaptureSession.StateCallback() {
             override fun onConfigured(session: CameraCaptureSession) {
                 captureSession = session
                 sessionLatch.countDown()
@@ -170,7 +224,41 @@ class Camera2Controller(private val context: Context) {
                 sessErr = RuntimeException("Session configure failed")
                 sessionLatch.countDown()
             }
-        }, handler)
+        }
+
+        // Use SessionConfiguration on API 28+ to properly configure max-res outputs
+        if (android.os.Build.VERSION.SDK_INT >= 28) {
+            val previewOutput = OutputConfiguration(previewSurface!!)
+            val stillOutput = OutputConfiguration(imageReader!!.surface)
+
+            // If the camera supports max-res and API >= 31, flag the still output
+            if (supportsMaxRes && android.os.Build.VERSION.SDK_INT >= 31) {
+                try {
+                    stillOutput.addSensorPixelModeUsed(CameraMetadata.SENSOR_PIXEL_MODE_MAXIMUM_RESOLUTION)
+                    Log.i(tag, "Set OutputConfiguration.addSensorPixelModeUsed for max resolution")
+                } catch (e: Exception) {
+                    Log.w(tag, "addSensorPixelModeUsed failed: $e")
+                }
+            }
+
+            val outputs = listOf(previewOutput, stillOutput)
+            val executor: Executor = Executor { command -> handler?.post(command) }
+            val sessionConfig = SessionConfiguration(
+                SessionConfiguration.SESSION_REGULAR,
+                outputs,
+                executor,
+                stateCallback
+            )
+            cam.createCaptureSession(sessionConfig)
+        } else {
+            // Fallback for older APIs
+            @Suppress("DEPRECATION")
+            cam.createCaptureSession(
+                listOf(previewSurface!!, imageReader!!.surface),
+                stateCallback,
+                handler
+            )
+        }
 
         if (!sessionLatch.await(8, TimeUnit.SECONDS)) {
             throw RuntimeException("Timeout configuring camera session")
@@ -211,6 +299,7 @@ class Camera2Controller(private val context: Context) {
      *
      * This gives true lossless output while using the maximum sensor megapixels.
      */
+    @SuppressLint("NewApi")
     @Synchronized
     fun captureFullResPng(): ByteArray {
         val reader = imageReader ?: throw RuntimeException("ImageReader not ready - call startPreview first")
@@ -238,31 +327,45 @@ class Camera2Controller(private val context: Context) {
 
         val req = cam.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
             addTarget(reader.surface)
-            // Maximum JPEG quality — only to get raw sensor data; we convert to PNG after
             set(CaptureRequest.JPEG_QUALITY, 100.toByte())
+
+            // Force max-resolution pixel mode if this camera supports it
+            if (supportsMaxRes && android.os.Build.VERSION.SDK_INT >= 31) {
+                try {
+                    set(CaptureRequest.SENSOR_PIXEL_MODE, CameraMetadata.SENSOR_PIXEL_MODE_MAXIMUM_RESOLUTION)
+                    Log.i(tag, "Set SENSOR_PIXEL_MODE_MAXIMUM_RESOLUTION")
+                } catch (e: Exception) {
+                    Log.w(tag, "SENSOR_PIXEL_MODE set failed: $e")
+                }
+            }
+
             applyManualSettings(this)
         }
 
         session.capture(req.build(), object : CameraCaptureSession.CaptureCallback() {}, handler)
 
-        if (!captureLatch.await(15, TimeUnit.SECONDS)) {
+        if (!captureLatch.await(30, TimeUnit.SECONDS)) {
             throw RuntimeException("Timeout waiting for camera capture")
         }
         captureErr?.let { throw it }
 
         val raw = jpegBytes ?: throw RuntimeException("No JPEG received from Camera2")
 
-        // --- Convert JPEG → PNG (lossless) ---
-        Log.i(tag, "Converting JPEG (${raw.size / 1024}KB) → PNG...")
+        // --- Convert JPEG -> PNG (lossless) ---
+        Log.i(tag, "Converting JPEG (${raw.size / 1024}KB) to PNG...")
         val bitmap = BitmapFactory.decodeByteArray(raw, 0, raw.size)
             ?: throw RuntimeException("Failed to decode JPEG to Bitmap")
+
+        val w = bitmap.width
+        val h = bitmap.height
+        Log.i(tag, "Bitmap dimensions: ${w}x${h} (${w.toLong() * h.toLong() / 1_000_000}MP)")
 
         val out = ByteArrayOutputStream()
         bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
         bitmap.recycle()
 
         val pngBytes = out.toByteArray()
-        Log.i(tag, "PNG size: ${pngBytes.size / 1024}KB  (${bitmap.width}×${bitmap.height})")
+        Log.i(tag, "PNG size: ${pngBytes.size / 1024}KB")
         return pngBytes
     }
 
@@ -281,6 +384,7 @@ class Camera2Controller(private val context: Context) {
         try { cameraDevice?.close() } catch (_: Exception) {}
         cameraDevice = null
         activeCameraId = null
+        supportsMaxRes = false
         try { thread?.quitSafely() } catch (_: Exception) {}
         thread = null
         handler = null
@@ -316,18 +420,35 @@ class Camera2Controller(private val context: Context) {
         }
     }
 
-    /** Returns the largest JPEG size the camera supports (maximum sensor resolution). */
+    /** Returns the largest JPEG size the camera supports (checks ultra-high res modes for 50MP/200MP). */
+    @SuppressLint("NewApi")
     private fun getMaxJpegSize(cameraId: String): Size {
         val cc = cameraManager.getCameraCharacteristics(cameraId)
-        val cfg = cc.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-            ?: return Size(4096, 3072)
-        val sizes = cfg.getOutputSizes(ImageFormat.JPEG)?.toList()
-            ?: return Size(4096, 3072)
-        // Sort by total pixels descending, return the largest
+        var sizes: List<Size>? = null
+
+        // Try to get unbinned MAXIMUM resolution sizes (Android 12+ for 50MP/200MP sensors)
+        if (android.os.Build.VERSION.SDK_INT >= 31) {
+            val maxMap = cc.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP_MAXIMUM_RESOLUTION)
+            sizes = maxMap?.getOutputSizes(ImageFormat.JPEG)?.toList()
+            if (sizes != null) {
+                Log.i(tag, "MAX_RES map sizes: ${sizes.map { "${it.width}x${it.height}" }}")
+            }
+        }
+
+        // Fallback to standard/binned map (~12MP usually)
+        if (sizes.isNullOrEmpty()) {
+            val cfg = cc.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            sizes = cfg?.getOutputSizes(ImageFormat.JPEG)?.toList()
+            if (sizes != null) {
+                Log.i(tag, "Standard map sizes: ${sizes.map { "${it.width}x${it.height}" }}")
+            }
+        }
+
+        if (sizes.isNullOrEmpty()) return Size(4096, 3072)
         return sizes.maxByOrNull { it.width.toLong() * it.height.toLong() } ?: sizes.first()
     }
 
-    /** Returns a preview size ≤ 1920×1080 with the same aspect ratio as the sensor. */
+    /** Returns a preview size <= 1920x1080 with the same aspect ratio as the sensor. */
     private fun pickPreviewSize(cameraId: String): Size {
         val cc = cameraManager.getCameraCharacteristics(cameraId)
         val cfg = cc.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)

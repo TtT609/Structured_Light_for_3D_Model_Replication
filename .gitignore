@@ -10,3 +10,13 @@ __pycache__/
 24_02_2026_3Dscan/
 02_03_2026_3Dscan/
 3.0.22.1/
+# Ignore Android files
+android_camera_host/CameraHostApp/.gradle/
+android_camera_host/CameraHostApp/build/
+android_camera_host/CameraHostApp/app/build/
+android_camera_host/CameraHostApp/local.properties
+android_camera_host/CameraHostApp/.idea/
+android_camera_host/CameraHostApp/*.iml
+android_camera_host/CameraHostApp/.cxx/
+*.apk
+*.aab

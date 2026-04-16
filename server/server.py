@@ -101,8 +101,9 @@ def monitor_disconnect():
         
         # Check current connection status
         if SERVER_STATE["connected"]:
-            # If the current time minus the last seen time exceeds 5 seconds
-            if time.time() - SERVER_STATE["last_seen"] > 5.0:
+            # If the current time minus the last seen time exceeds 30 seconds
+            # (increased from 5s to handle large 50MP PNG captures that take 15-25s)
+            if time.time() - SERVER_STATE["last_seen"] > 30.0:
                 # Log that the phone has disconnected
                 print("[System] ❌ Phone Disconnected") 
                 # Reset system status to disconnected (False)

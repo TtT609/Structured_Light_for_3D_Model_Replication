@@ -3,7 +3,6 @@ package com.example.camerahost
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
-import android.graphics.BitmapFactory
 import android.graphics.SurfaceTexture
 import android.os.Bundle
 import android.os.Handler
@@ -30,7 +29,6 @@ class MainActivity : AppCompatActivity(), TextureView.SurfaceTextureListener {
     private lateinit var logContainer: LinearLayout
     private lateinit var imgThumbnail: ImageView
     private lateinit var uploadingOverlay: FrameLayout
-    private lateinit var btnShutter: FrameLayout
     private lateinit var settingsPanel: LinearLayout
     private lateinit var proModePanel: LinearLayout
 
@@ -123,7 +121,6 @@ class MainActivity : AppCompatActivity(), TextureView.SurfaceTextureListener {
         logContainer     = findViewById(R.id.logContainer)
         imgThumbnail     = findViewById(R.id.imgThumbnail)
         uploadingOverlay = findViewById(R.id.uploadingOverlay)
-        btnShutter       = findViewById(R.id.btnShutter)
         settingsPanel    = findViewById(R.id.settingsPanel)
         proModePanel     = findViewById(R.id.proModePanel)
 
@@ -147,29 +144,6 @@ class MainActivity : AppCompatActivity(), TextureView.SurfaceTextureListener {
 
     private fun setupListeners() {
 
-        // Shutter button → manual capture
-        btnShutter.setOnClickListener {
-            val cam = camera ?: return@setOnClickListener
-            if (poller == null) return@setOnClickListener   // not connected
-            Thread {
-                try {
-                    onUiThread { setStatus(ServerPoller.State.CAPTURING) }
-                    val png = cam.captureFullResPng()
-                    onUiThread { setStatus(ServerPoller.State.UPLOADING) }
-                    uploadManual(png)
-                    onUiThread {
-                        addLog("Manual capture uploaded.")
-                        setStatus(ServerPoller.State.CONNECTED)
-                    }
-                } catch (e: Exception) {
-                    onUiThread {
-                        addLog("Capture error: ${e.message}")
-                        setStatus(ServerPoller.State.ERROR)
-                    }
-                }
-            }.also { it.isDaemon = true }.start()
-        }
-
         // Pro Mode toggle
         btnProMode.setOnClickListener {
             proModeVisible = !proModeVisible
@@ -189,7 +163,7 @@ class MainActivity : AppCompatActivity(), TextureView.SurfaceTextureListener {
             settingsPanel.visibility = if (settingsVisible) View.VISIBLE else View.GONE
         }
 
-        // Save settings
+        // Save settings — wrap restartPolling in try/catch so it never crashes the app
         btnSaveSettings.setOnClickListener {
             val url = editServerUrl.text.toString().trim().trimEnd('/')
             val selectedCam = spinnerCamera.selectedItem as? String ?: ""
@@ -198,7 +172,19 @@ class MainActivity : AppCompatActivity(), TextureView.SurfaceTextureListener {
                 savePrefs(url, selectedCam)
                 settingsPanel.visibility = View.GONE
                 settingsVisible = false
-                restartPolling()
+                addLog("Saved URL: $url")
+                // Restart poller on a background thread to avoid crash on main thread
+                Thread {
+                    try {
+                        restartPolling()
+                    } catch (e: Exception) {
+                        Log.e(tag, "restartPolling error: $e", e)
+                        onUiThread {
+                            addLog("Connection error: ${e.message}")
+                            setStatus(ServerPoller.State.ERROR)
+                        }
+                    }
+                }.also { it.isDaemon = true }.start()
             }
         }
 
@@ -207,22 +193,23 @@ class MainActivity : AppCompatActivity(), TextureView.SurfaceTextureListener {
     }
 
     private fun setupSeekBarListeners() {
-        seekIso.max = isoSteps.size  // 0 = auto, 1..n = manual
-        seekExpTime.max = expSteps.size
-        seekFocus.max = focusSteps
+        // Slider range = direct index into the step tables (no AUTO position)
+        seekIso.max = isoSteps.size - 1       // 0..8 → maps to 50..12800
+        seekExpTime.max = expSteps.size - 1   // 0..10 → maps to 1/1000..1s
+        seekFocus.max = 100                    // 0..100 → maps to 0.00..1.00 diopters
+
+        // Set default positions to middle of range
+        seekIso.progress = 2         // ISO 200
+        seekExpTime.progress = 4     // 1/60s
+        seekFocus.progress = 50      // 0.50
 
         seekIso.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(sb: SeekBar?, p: Int, byUser: Boolean) {
                 val cam = camera ?: return
-                if (!chkManualExposure.isChecked) { txtIso.text = "AUTO"; return }
-                if (p == 0) {
-                    cam.manualIso = null
-                    txtIso.text = "AUTO"
-                } else {
-                    val iso = isoSteps.getOrElse(p - 1) { isoSteps.last() }
-                    cam.manualIso = iso
-                    txtIso.text = iso.toString()
-                }
+                if (!chkManualExposure.isChecked) return   // ignore slider when in auto mode
+                val iso = isoSteps[p]
+                cam.manualIso = iso
+                txtIso.text = iso.toString()
                 cam.refreshPreviewSettings()
             }
             override fun onStartTrackingTouch(sb: SeekBar?) {}
@@ -232,15 +219,10 @@ class MainActivity : AppCompatActivity(), TextureView.SurfaceTextureListener {
         seekExpTime.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(sb: SeekBar?, p: Int, byUser: Boolean) {
                 val cam = camera ?: return
-                if (!chkManualExposure.isChecked) { txtExpTime.text = "AUTO"; return }
-                if (p == 0) {
-                    cam.manualExposureTimeNs = null
-                    txtExpTime.text = "AUTO"
-                } else {
-                    val ns = expSteps.getOrElse(p - 1) { expSteps.last() }
-                    cam.manualExposureTimeNs = ns
-                    txtExpTime.text = formatShutter(ns)
-                }
+                if (!chkManualExposure.isChecked) return
+                val ns = expSteps[p]
+                cam.manualExposureTimeNs = ns
+                txtExpTime.text = formatShutter(ns)
                 cam.refreshPreviewSettings()
             }
             override fun onStartTrackingTouch(sb: SeekBar?) {}
@@ -250,32 +232,47 @@ class MainActivity : AppCompatActivity(), TextureView.SurfaceTextureListener {
         seekFocus.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(sb: SeekBar?, p: Int, byUser: Boolean) {
                 val cam = camera ?: return
-                if (!chkManualFocus.isChecked) { txtFocus.text = "AUTO"; return }
-                if (p == 0) {
-                    cam.manualFocusDistance = null
-                    txtFocus.text = "AUTO"
-                } else {
-                    val dist = (p.toFloat() / focusSteps.toFloat())
-                    cam.manualFocusDistance = dist
-                    txtFocus.text = "%.2f".format(dist)
-                }
+                if (!chkManualFocus.isChecked) return
+                val dist = p.toFloat() / 100f
+                cam.manualFocusDistance = dist
+                txtFocus.text = "%.2f".format(dist)
                 cam.refreshPreviewSettings()
             }
             override fun onStartTrackingTouch(sb: SeekBar?) {}
             override fun onStopTrackingTouch(sb: SeekBar?) {}
         })
 
+        // When Manual Focus checkbox toggled
         chkManualFocus.setOnCheckedChangeListener { _, checked ->
             val cam = camera ?: return@setOnCheckedChangeListener
-            if (!checked) { cam.manualFocusDistance = null; txtFocus.text = "AUTO" }
+            if (checked) {
+                // Apply current slider value immediately
+                val dist = seekFocus.progress.toFloat() / 100f
+                cam.manualFocusDistance = dist
+                txtFocus.text = "%.2f".format(dist)
+            } else {
+                cam.manualFocusDistance = null
+                txtFocus.text = "AUTO"
+            }
             cam.refreshPreviewSettings()
         }
 
+        // When Manual Exposure checkbox toggled
         chkManualExposure.setOnCheckedChangeListener { _, checked ->
             val cam = camera ?: return@setOnCheckedChangeListener
-            if (!checked) {
-                cam.manualIso = null; cam.manualExposureTimeNs = null
-                txtIso.text = "AUTO"; txtExpTime.text = "AUTO"
+            if (checked) {
+                // Apply current slider values immediately
+                val iso = isoSteps[seekIso.progress]
+                val ns = expSteps[seekExpTime.progress]
+                cam.manualIso = iso
+                cam.manualExposureTimeNs = ns
+                txtIso.text = iso.toString()
+                txtExpTime.text = formatShutter(ns)
+            } else {
+                cam.manualIso = null
+                cam.manualExposureTimeNs = null
+                txtIso.text = "AUTO"
+                txtExpTime.text = "AUTO"
             }
             cam.refreshPreviewSettings()
         }
@@ -298,7 +295,7 @@ class MainActivity : AppCompatActivity(), TextureView.SurfaceTextureListener {
             val idx = ids.indexOf(defaultId).takeIf { it >= 0 } ?: 0
             spinnerCamera.setSelection(idx)
 
-            // Open camera
+            // Open camera on background thread
             Thread {
                 try {
                     ctrl.openCamera(ids[idx])
@@ -306,12 +303,19 @@ class MainActivity : AppCompatActivity(), TextureView.SurfaceTextureListener {
                     val st = textureView.surfaceTexture
                     if (textureView.isAvailable && st != null) {
                         ctrl.startPreview(st)
-                        addLog("Camera ready: ${ctrl.getCameraLabel(ids[idx])}")
+                        onUiThread { addLog("Camera ready: ${ctrl.getCameraLabel(ids[idx])}") }
                     }
-                    // Start polling
-                    if (serverUrl.isNotEmpty()) startPolling()
+                    // Start polling if URL has been configured
+                    if (serverUrl.isNotEmpty()) {
+                        try {
+                            startPolling()
+                        } catch (e: Exception) {
+                            Log.e(tag, "startPolling error: $e", e)
+                            onUiThread { addLog("Polling error: ${e.message}") }
+                        }
+                    }
                 } catch (e: Exception) {
-                    Log.e(tag, "Camera open failed: $e")
+                    Log.e(tag, "Camera open failed: $e", e)
                     onUiThread { addLog("Camera error: ${e.message}") }
                 }
             }.also { it.isDaemon = true }.start()
@@ -327,7 +331,7 @@ class MainActivity : AppCompatActivity(), TextureView.SurfaceTextureListener {
         val cam = camera ?: return
         Thread {
             try { cam.startPreview(surface) } catch (e: Exception) {
-                Log.e(tag, "startPreview failed: $e")
+                Log.e(tag, "startPreview failed: $e", e)
             }
         }.also { it.isDaemon = true }.start()
     }
@@ -343,7 +347,7 @@ class MainActivity : AppCompatActivity(), TextureView.SurfaceTextureListener {
     private fun startPolling() {
         if (serverUrl.isEmpty()) return
         poller?.stop()
-        addLog("Connecting to $serverUrl…")
+        onUiThread { addLog("Connecting to $serverUrl...") }
         poller = ServerPoller(
             serverUrl = serverUrl,
             onCapture  = {
@@ -354,7 +358,7 @@ class MainActivity : AppCompatActivity(), TextureView.SurfaceTextureListener {
                     setStatus(state)
                     if (state == ServerPoller.State.CONNECTED) addLog("Linked to PC.")
                     if (state == ServerPoller.State.UPLOADING) {
-                        addLog("Captured & uploading PNG…")
+                        addLog("Captured & uploading PNG...")
                         refreshThumbnail()
                     }
                 }
@@ -367,28 +371,6 @@ class MainActivity : AppCompatActivity(), TextureView.SurfaceTextureListener {
         poller?.stop()
         poller = null
         startPolling()
-    }
-
-    /** Manual shutter upload — reuse the same /upload endpoint. */
-    private fun uploadManual(png: ByteArray) {
-        val url = "$serverUrl/upload"
-        val boundary = "SLBoundary${System.currentTimeMillis()}"
-        val conn = (java.net.URL(url).openConnection() as java.net.HttpURLConnection).apply {
-            requestMethod = "POST"
-            doOutput = true
-            setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
-            connectTimeout = 5_000
-            readTimeout = 60_000
-        }
-        java.io.DataOutputStream(conn.outputStream).use { out ->
-            out.writeBytes("--$boundary\r\n")
-            out.writeBytes("Content-Disposition: form-data; name=\"file\"; filename=\"capture.png\"\r\n")
-            out.writeBytes("Content-Type: image/png\r\n\r\n")
-            out.write(png)
-            out.writeBytes("\r\n--$boundary--\r\n")
-        }
-        conn.responseCode   // trigger send
-        conn.disconnect()
     }
 
     // =========================================================================
@@ -409,8 +391,6 @@ class MainActivity : AppCompatActivity(), TextureView.SurfaceTextureListener {
 
         val uploading = state == ServerPoller.State.UPLOADING || state == ServerPoller.State.CAPTURING
         uploadingOverlay.visibility = if (uploading) View.VISIBLE else View.GONE
-        btnShutter.isEnabled = !uploading
-        btnShutter.alpha = if (uploading) 0.5f else 1.0f
     }
 
     private fun addLog(msg: String) {
@@ -441,7 +421,6 @@ class MainActivity : AppCompatActivity(), TextureView.SurfaceTextureListener {
     }
 
     private fun refreshThumbnail() {
-        // Show placeholder immediately; a proper thumbnail would need extra capture
         imgThumbnail.visibility = View.VISIBLE
     }
 

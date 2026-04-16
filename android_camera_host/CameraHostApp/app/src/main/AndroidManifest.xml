@@ -9,6 +9,7 @@
     <application
         android:allowBackup="true"
         android:label="SL Camera"
+        android:usesCleartextTraffic="true"
         android:supportsRtl="true"
         android:theme="@style/Theme.CameraHost">
 

@@ -39,7 +39,7 @@
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_weight="1"
-            android:text="📷  Project SL"
+            android:text="SL Camera"
             android:textColor="#FFFFFF"
             android:textStyle="bold"
             android:textSize="15sp" />
@@ -63,10 +63,10 @@
         <!-- Pro Mode toggle button -->
         <Button
             android:id="@+id/btnProMode"
-            android:layout_width="36dp"
+            android:layout_width="48dp"
             android:layout_height="36dp"
-            android:text="⚙"
-            android:textSize="14sp"
+            android:text="PRO"
+            android:textSize="12sp"
             android:textColor="#FFFFFF"
             android:background="#44FFFFFF"
             android:layout_marginEnd="6dp"
@@ -75,10 +75,10 @@
         <!-- Settings button -->
         <Button
             android:id="@+id/btnSettings"
-            android:layout_width="36dp"
+            android:layout_width="48dp"
             android:layout_height="36dp"
-            android:text="≡"
-            android:textSize="18sp"
+            android:text="SET"
+            android:textSize="12sp"
             android:textColor="#FFFFFF"
             android:background="#44FFFFFF"
             style="@style/Widget.AppCompat.Button.Borderless" />
@@ -135,28 +135,8 @@
 
     </FrameLayout>
 
-    <!-- ══════════════════════════════════════════
-         Shutter button (bottom-center)
-    ══════════════════════════════════════════ -->
-    <FrameLayout
-        android:id="@+id/btnShutter"
-        android:layout_width="80dp"
-        android:layout_height="80dp"
-        android:layout_marginBottom="24dp"
-        android:background="@drawable/shutter_bg"
-        android:clickable="true"
-        android:focusable="true"
-        app:layout_constraintBottom_toBottomOf="parent"
-        app:layout_constraintStart_toStartOf="parent"
-        app:layout_constraintEnd_toEndOf="parent">
+    <!-- Removed btnShutter per request -->
 
-        <View
-            android:layout_width="62dp"
-            android:layout_height="62dp"
-            android:layout_gravity="center"
-            android:background="@drawable/shutter_inner_bg" />
-
-    </FrameLayout>
 
     <!-- ══════════════════════════════════════════
          SETTINGS PANEL (slides up from bottom)
@@ -169,6 +149,8 @@
         android:background="#EE0D1117"
         android:padding="20dp"
         android:visibility="gone"
+        android:clickable="true"
+        android:focusable="true"
         app:layout_constraintBottom_toBottomOf="parent"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent">
@@ -176,7 +158,7 @@
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="⚙  App Settings"
+            android:text="App Settings"
             android:textColor="#FFFFFF"
             android:textStyle="bold"
             android:textSize="16sp"
@@ -243,6 +225,8 @@
         android:padding="20dp"
         android:paddingBottom="108dp"
         android:visibility="gone"
+        android:clickable="true"
+        android:focusable="true"
         app:layout_constraintBottom_toBottomOf="parent"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent">
@@ -250,7 +234,7 @@
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="🎛  Manual Controls"
+            android:text="Manual Controls"
             android:textColor="#FFFFFF"
             android:textStyle="bold"
             android:textSize="15sp"

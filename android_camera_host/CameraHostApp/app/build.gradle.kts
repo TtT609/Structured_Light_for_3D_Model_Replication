@@ -9,7 +9,7 @@ android {
 
     defaultConfig {
         applicationId = "com.example.camerahost"
-        minSdk = 24
+        minSdk = 26
         targetSdk = 34
         versionCode = 2
         versionName = "2.0"
