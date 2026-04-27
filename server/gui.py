@@ -111,6 +111,11 @@ class ScannerGUI:
         self.merge_final_voxel = tk.DoubleVar(value=0.5) # Final overlapping point reduction
         # Checkbox: toggle step-by-step 3D preview popup (blocks merge between steps until window closed)
         self.merge_show_preview = tk.BooleanVar(value=False)
+        # Preview colour-coding: previous (accumulated) cloud and newly added cloud
+        self.merge_prev_color = [0.8, 0.2, 0.2]   # default: red  (RGB 0-1)
+        self.merge_new_color  = [0.2, 0.9, 0.3]   # default: green (RGB 0-1)
+        # Toggle normal-based depth shading in the preview (makes point cloud look 3-D)
+        self.merge_preview_shading = tk.BooleanVar(value=True)
         
         # 360 Meshing Params (Surface meshing)
         self.m360_input_ply = tk.StringVar()
@@ -736,10 +741,66 @@ class ScannerGUI:
         
         prev_desc = (
             "When checked, an Open3D 3D viewer window will pop up after EACH step showing\n"
-            "the cumulative result so far (step 1 = scan 0+1, step 2 = scan 0+1+2, ...).\n"
+            "the previous scans (OLD colour) vs the newly added scan (NEW colour).\n"
             "⚠ The merge process PAUSES until you close each preview window."
         )
-        ttk.Label(lf_preview, text=prev_desc, foreground="#555", justify=tk.LEFT, wraplength=650).pack(padx=5, pady=(0, 5))
+        ttk.Label(lf_preview, text=prev_desc, foreground="#555", justify=tk.LEFT, wraplength=650).pack(padx=5, pady=(0, 3))
+
+        # --- Colour pickers + shading toggle ---
+        f_colors = ttk.Frame(lf_preview); f_colors.pack(fill=tk.X, padx=5, pady=(2, 5))
+
+        # Helper: open a colour-chooser dialog and update the stored RGB list
+        def _pick_color(current_list, btn_widget, label_text):
+            import tkinter.colorchooser as cc
+            # Convert 0-1 floats → #RRGGBB for the initial colour
+            init_hex = "#{:02x}{:02x}{:02x}".format(
+                int(current_list[0]*255), int(current_list[1]*255), int(current_list[2]*255))
+            result = cc.askcolor(color=init_hex, title=f"Choose {label_text} colour")
+            if result and result[0]:  # result = ((r,g,b), '#hex') or (None, None)
+                r, g, b = result[0]
+                current_list[0] = r / 255.0
+                current_list[1] = g / 255.0
+                current_list[2] = b / 255.0
+                btn_widget.config(bg=result[1], activebackground=result[1])
+
+        ttk.Label(f_colors, text="Preview colours:").pack(side=tk.LEFT, padx=(0, 6))
+
+        # OLD cloud colour button
+        old_hex = "#{:02x}{:02x}{:02x}".format(
+            int(self.merge_prev_color[0]*255),
+            int(self.merge_prev_color[1]*255),
+            int(self.merge_prev_color[2]*255))
+        self._btn_old_color = tk.Button(
+            f_colors, text="OLD (previous)", bg=old_hex, width=14,
+            relief="raised", borderwidth=2)
+        self._btn_old_color.config(
+            command=lambda: _pick_color(self.merge_prev_color, self._btn_old_color, "OLD"))
+        self._btn_old_color.pack(side=tk.LEFT, padx=4)
+
+        # NEW cloud colour button
+        new_hex = "#{:02x}{:02x}{:02x}".format(
+            int(self.merge_new_color[0]*255),
+            int(self.merge_new_color[1]*255),
+            int(self.merge_new_color[2]*255))
+        self._btn_new_color = tk.Button(
+            f_colors, text="NEW (added)", bg=new_hex, width=14,
+            relief="raised", borderwidth=2)
+        self._btn_new_color.config(
+            command=lambda: _pick_color(self.merge_new_color, self._btn_new_color, "NEW"))
+        self._btn_new_color.pack(side=tk.LEFT, padx=4)
+
+        # Depth shading toggle
+        ttk.Checkbutton(
+            f_colors,
+            text="Enable depth shading (normals)",
+            variable=self.merge_preview_shading
+        ).pack(side=tk.LEFT, padx=(12, 4))
+
+        shade_tip = ttk.Label(
+            f_colors,
+            text="(Estimates surface normals so the viewer shows realistic 3-D shading/shadow)",
+            foreground="#888", font=("Arial", 8, "italic"))
+        shade_tip.pack(side=tk.LEFT, padx=2)
 
         ttk.Button(root, text="Merge 360 Point Clouds", command=self.do_merge_360).pack(fill=tk.X, padx=20, pady=20)
 
@@ -1595,26 +1656,66 @@ class ScannerGUI:
 
         # --- Step preview callback ---
         # Called from the merge thread after each step with:
-        #   step_index  : which step just finished (1-based)
-        #   total_steps : total number of merge steps
-        #   cloud_so_far: copy of the fully accumulated cloud up to this step
-        # The Open3D draw_geometries() call here is BLOCKING — the merge pauses
+        #   step_index   : which step just finished (1-based)
+        #   total_steps  : total number of merge steps
+        #   prev_cloud   : the accumulated cloud BEFORE this step (old scans)
+        #   new_cloud    : only the newly added scan (transformed into world frame)
+        # The Open3D Visualizer call here is BLOCKING — the merge pauses
         # until the user closes the 3D window. This only runs if the checkbox is ticked.
-        def step_preview_callback(step_index, total_steps, cloud_so_far):
+        def step_preview_callback(step_index, total_steps, prev_cloud, new_cloud):
             import open3d as o3d
-            # Build a human-readable title showing which scans are accumulated
-            # e.g. step 2/5 shows scans 0+1+2
+            import copy
+
+            # Snapshot of the user-chosen colours (so they're stable for this popup)
+            prev_rgb = list(self.merge_prev_color)   # e.g. [0.8, 0.2, 0.2]
+            new_rgb  = list(self.merge_new_color)    # e.g. [0.2, 0.9, 0.3]
+            use_shading = self.merge_preview_shading.get()
+
+            # ── Apply flat colours ─────────────────────────────────────────
+            old_vis = copy.deepcopy(prev_cloud)
+            new_vis = copy.deepcopy(new_cloud)
+            old_vis.paint_uniform_color(prev_rgb)
+            new_vis.paint_uniform_color(new_rgb)
+
+            geoms = [old_vis, new_vis]
+
+            # ── Normal-based depth shading ─────────────────────────────────
+            # Estimating normals on each sub-cloud lets Open3D's renderer apply
+            # per-point Phong shading, giving the flat colour mass a 3-D look
+            # with highlights and shadows — without losing the colour distinction.
+            if use_shading:
+                for g in geoms:
+                    if not g.has_normals():
+                        # Use a moderate radius so normals are smooth but fast
+                        g.estimate_normals(
+                            search_param=o3d.geometry.KDTreeSearchParamHybrid(
+                                radius=5.0, max_nn=30))
+                        g.orient_normals_consistent_tangent_plane(20)
+
+            # ── Open the interactive viewer ────────────────────────────────
             scan_labels = "+".join(str(k) for k in range(step_index + 1))
-            window_title = f"Step {step_index}/{total_steps}  |  Accumulated scans: {scan_labels}  (close to continue)"
+            window_title = (f"Step {step_index}/{total_steps}  |  "
+                            f"Scans: {scan_labels}  "
+                            f"[OLD={prev_rgb}  NEW={new_rgb}]  "
+                            f"(close to continue)")
             print(f"[Preview] Opening 3D viewer: {window_title}")
-            # Assign a distinct color so each step is easy to identify (optional: uniform colour for clean look)
-            o3d.visualization.draw_geometries(
-                [cloud_so_far],
-                window_name=window_title,
-                width=900,
-                height=700,
-                point_show_normal=False
-            )
+
+            # Use the full Visualizer so we get proper lighting/shading when normals exist
+            vis = o3d.visualization.Visualizer()
+            vis.create_window(window_name=window_title, width=960, height=720)
+            for g in geoms:
+                vis.add_geometry(g)
+
+            # Render options: enable normal-based shading if requested
+            opt = vis.get_render_option()
+            opt.point_size = 2.0
+            if use_shading:
+                opt.light_on = True   # Phong point-cloud shading
+            else:
+                opt.light_on = False  # Pure flat colour — no shading
+
+            vis.run()          # blocks until user closes the window
+            vis.destroy_window()
             print(f"[Preview] Window closed, continuing to next step...")
 
         # Only attach the callback when the checkbox is ticked

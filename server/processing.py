@@ -490,8 +490,12 @@ class ProcessingLogic:
     @staticmethod
     def merge_pro_360(input_folder, output_path, voxel_size=0.02, icp_dist_ratio=1.5, outlier_nb=20, outlier_std=2.0, sample_before=1, sample_after=1, final_voxel=0.5, step_callback=None):
         # Main function to sequence and merge 3D models obtained from a 360-degree scan (multiple angles) together
-        # step_callback: optional function(step_index, total_steps, accumulated_cloud) called after each merge step
-        #                When provided, the UI can use this to show a 3D preview popup for that step
+        # step_callback: optional function(step_index, total_steps, prev_cloud, new_cloud)
+        #                called after each merge step.
+        #                prev_cloud = accumulated cloud BEFORE this step (all old scans).
+        #                new_cloud  = only the newly transformed scan added at this step.
+        #                When provided, the UI can use these two separate clouds for colour-coded
+        #                diff visualisation and normal-based depth shading.
         print(f"[Merge 360] Loading clouds from {input_folder}...")
         
         # Find all .ply files in the folder
@@ -516,7 +520,7 @@ class ProcessingLogic:
                     return int(numbers[-1])
             except:
                 pass
-            return 0 # Default if parsing fails
+            return 0 # Default if parsing fails 
 
         ply_files = sorted(ply_files, key=extract_degree)
         print(f"[Merge 360] Sorted file order:")
@@ -588,21 +592,27 @@ class ProcessingLogic:
             
             # 4. Convert it to a relationship from i shifted down to compare with the absolute base model 0, so that all pieces are on the same stage
             max_accum_T = np.dot(max_accum_T, T_local)
-            
-            # 5. Command to transform and combine it with the base stage
+
+            # 5. Build the newly-added scan in world frame (before combining)
             pcd_temp = copy.deepcopy(source) 
             pcd_temp.transform(max_accum_T) # Change the position of the latest model and overlap it
+
+            # 6. If a step_callback is registered, snapshot BEFORE merging so we can show
+            #    old vs new as separate colour-coded clouds in the preview popup.
+            if step_callback is not None:
+                prev_snapshot = copy.deepcopy(merged_cloud)  # accumulated cloud BEFORE this step
+                new_snapshot  = copy.deepcopy(pcd_temp)      # the new scan just aligned
+
+            # 7. Command to combine it with the base stage
             merged_cloud += pcd_temp        # Combine together
             
             print(f"  [Merge 360] Step {i}/{total_steps} complete. Accumulated cloud: {len(merged_cloud.points)} points total.")
             
-            # 6. If a step_callback is registered (e.g. from GUI checkbox), call it now with a snapshot
-            #    of the current accumulated cloud. This allows the GUI to display a 3D preview popup.
+            # 8. Fire the callback (if any) with the two separate clouds so the GUI can
+            #    display OLD in one colour and NEW in another, with optional normal shading.
             #    The merge process will pause here (blocking) until the callback returns.
             if step_callback is not None:
-                # Provide a lightweight copy to avoid mutating the live accumulator
-                preview_cloud = copy.deepcopy(merged_cloud)
-                step_callback(i, total_steps, preview_cloud)
+                step_callback(i, total_steps, prev_snapshot, new_snapshot)
             
         print(f"\n[Merge 360] All {total_steps} steps complete. Running post-processing...")
         print(f"[Merge 360] Post-processing (Final Voxel: {final_voxel}, Outlier removal)...")
