@@ -237,17 +237,37 @@ class ProcessingLogic:
 
     @staticmethod
     def _save_ply(points, colors, filename):
-        # Save as a .ply file with colors
-        with open(filename, 'w') as f:
-            f.write("ply\nformat ascii 1.0\n")
-            f.write(f"element vertex {len(points)}\n")
-            f.write("property float x\nproperty float y\nproperty float z\n")
-            f.write("property uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n")
-            
-            for i in range(len(points)):
+        # Save as a binary little-endian .ply file with colors.
+        # Binary format is 3-5x smaller than ASCII and loads much faster
+        # in MeshLab, CloudCompare, and Open3D.
+        import struct
+        n = len(points)
+        header = (
+            "ply\n"
+            "format binary_little_endian 1.0\n"
+            f"element vertex {n}\n"
+            "property float x\n"
+            "property float y\n"
+            "property float z\n"
+            "property uchar red\n"
+            "property uchar green\n"
+            "property uchar blue\n"
+            "end_header\n"
+        )
+        with open(filename, 'wb') as f:
+            f.write(header.encode('ascii'))
+            # Pack all vertices at once: 3 floats (xyz) + 3 unsigned bytes (BGR→RGB)
+            # struct format: '<fff' = 3 little-endian floats, '3B' = 3 unsigned bytes
+            row_fmt = '<fff3B'
+            row_size = struct.calcsize(row_fmt)
+            buf = bytearray(n * row_size)
+            for i in range(n):
                 p = points[i]
                 c = colors[i]
-                f.write(f"{p[0]:.4f} {p[1]:.4f} {p[2]:.4f} {c[2]} {c[1]} {c[0]}\n")
+                struct.pack_into(row_fmt, buf, i * row_size,
+                                 float(p[0]), float(p[1]), float(p[2]),
+                                 int(c[2]), int(c[1]), int(c[0]))  # BGR → RGB
+            f.write(buf)
 
     @staticmethod
     def process_multi_ply(calib_path, target_path, mode, log_callback=None,
@@ -488,7 +508,7 @@ class ProcessingLogic:
         return result
 
     @staticmethod
-    def merge_pro_360(input_folder, output_path, voxel_size=0.02, icp_dist_ratio=1.5, outlier_nb=20, outlier_std=2.0, sample_before=1, sample_after=1, final_voxel=0.5, step_callback=None):
+    def merge_pro_360(input_folder, output_path, voxel_size=0.02, icp_dist_ratio=1.5, outlier_nb=20, outlier_std=2.0, sample_before=1, sample_after=1, final_voxel=0.5, step_callback=None, accum_mode=False, icp_fine_pass=True):
         # Main function to sequence and merge 3D models obtained from a 360-degree scan (multiple angles) together
         # step_callback: optional function(step_index, total_steps, prev_cloud, new_cloud)
         #                called after each merge step.
@@ -496,7 +516,16 @@ class ProcessingLogic:
         #                new_cloud  = only the newly transformed scan added at this step.
         #                When provided, the UI can use these two separate clouds for colour-coded
         #                diff visualisation and normal-based depth shading.
+        # accum_mode: When True, RANSAC/ICP at each step aligns scan[i] against the FULL
+        #             accumulated merged cloud (scan[0]+...+scan[i-1]) instead of only scan[i-1].
+        #             This gives the registration far more overlap to work with, improving
+        #             robustness at the cost of a slightly slower target preprocessing per step.
+        # icp_fine_pass: When True (default), a second ICP refinement pass is run at a tighter
+        #             distance threshold (voxel_size * 0.4) after the main ICP to squeeze
+        #             out extra sub-voxel precision from the alignment.
         print(f"[Merge 360] Loading clouds from {input_folder}...")
+        print(f"[Merge 360] Registration mode: {'Accumulative (vs full merged cloud)' if accum_mode else 'Sequential (vs previous scan only)'}")
+        print(f"[Merge 360] ICP fine pass: {'ON' if icp_fine_pass else 'OFF'}")
         
         # Find all .ply files in the folder
         ply_files = glob.glob(os.path.join(input_folder, "*.ply"))
@@ -551,12 +580,21 @@ class ProcessingLogic:
         # Keep a history of the accumulated transformation matrices of every frame (Current Global Transform)
         max_accum_T = np.identity(4) 
         
-        # Loop to compare and connect models pair by pair (Model 1 to 0, Model 2 to 1,...) continuously 
+        # Loop to compare and connect models pair by pair (or against full accumulated cloud)
         for i in range(1, len(pcds)):
-            print(f"\n[Merge 360] === Step {i}/{total_steps}: Aligning Scan {i} -> Scan {i-1} ===")
             source = pcds[i]      # Latest model (moving towards target)
-            target = pcds[i-1]    # Previous model (standing still)
-            
+
+            if accum_mode:
+                # Accumulative mode: align against the full merged cloud so far
+                target = merged_cloud
+                scan_label = f"Scans 0..{i-1} (accumulated)"
+            else:
+                # Sequential mode: align only against the immediately previous scan
+                target = pcds[i-1]
+                scan_label = f"Scan {i-1}"
+
+            print(f"\n[Merge 360] === Step {i}/{total_steps}: Aligning Scan {i} -> {scan_label} ===")
+
             # 1. Preprocess prepare both data (Downsample + calculate Normals)
             source_down, source_fpfh = ProcessingLogic.preprocess_point_cloud(source, voxel_size)
             target_down, target_fpfh = ProcessingLogic.preprocess_point_cloud(target, voxel_size)
@@ -573,19 +611,53 @@ class ProcessingLogic:
             if ransac_result.fitness < 0.05:
                 print(f"  [WARNING] Step {i}: RANSAC fitness is very low ({ransac_result.fitness:.4f})! "
                       f"Alignment may be unreliable. Try lowering Voxel Size or increasing ICP Dist Ratio.")
-            
-            # 3. Let Open3D precisely adjust the overlap from the initial RANSAC guess (Local ICP Refinement Point-to-Plane)
+
+            # 3. Coarse ICP refinement — max distance = voxel_size * icp_dist_ratio
+            #    (Same search radius as RANSAC, so fitness is comparable and ICP has room to converge)
+            icp_coarse_dist = voxel_size * icp_dist_ratio
             icp_result = o3d.pipelines.registration.registration_icp(
-                source_down, target_down, voxel_size, ransac_result.transformation,
+                source_down, target_down, icp_coarse_dist, ransac_result.transformation,
                 o3d.pipelines.registration.TransformationEstimationPointToPlane())
+
+            print(f"  [ICP]    Fitness: {icp_result.fitness:.4f} | RMSE: {icp_result.inlier_rmse:.6f}  (threshold={icp_coarse_dist:.3f})")
             
-            # --- Fitness check after ICP ---
-            # If fitness is still very low here, this step's merge will be corrupted and affect all subsequent steps
-            print(f"  [ICP]    Fitness: {icp_result.fitness:.4f} | RMSE: {icp_result.inlier_rmse:.6f}")
-            if icp_result.fitness < 0.05:
-                print(f"  [WARNING] Step {i}: ICP fitness is very low ({icp_result.fitness:.4f})! "
+            # Save coarse fitness for quality evaluation. Fine fitness will naturally be much 
+            # lower due to its tiny threshold, so it shouldn't be used to judge overall overlap.
+            fit_coarse = icp_result.fitness
+
+            # 4. Optional fine ICP second pass at a tighter threshold to squeeze out sub-voxel precision
+            if icp_fine_pass:
+                icp_fine_dist = voxel_size * 0.4
+                icp_fine = o3d.pipelines.registration.registration_icp(
+                    source_down, target_down, icp_fine_dist, icp_result.transformation,
+                    o3d.pipelines.registration.TransformationEstimationPointToPlane())
+                print(f"  [ICP-Fine] Fitness: {icp_fine.fitness:.4f} | RMSE: {icp_fine.inlier_rmse:.6f}  (threshold={icp_fine_dist:.3f})")
+                # Only accept fine-pass result if it does not degrade alignment
+                if icp_fine.inlier_rmse < icp_result.inlier_rmse or icp_result.inlier_rmse == 0:
+                    icp_result = icp_fine
+                    print(f"  [ICP-Fine] Accepted (RMSE improved).")
+                else:
+                    print(f"  [ICP-Fine] Rejected (RMSE did not improve — keeping coarse ICP result).")
+
+            # --- Quality summary ---
+            rmse_final = icp_result.inlier_rmse
+            fit_eval   = fit_coarse
+            
+            ransac_rmse = ransac_result.inlier_rmse
+            rmse_improvement = ((ransac_rmse - rmse_final) / ransac_rmse * 100) if ransac_rmse > 0 else 0
+            quality = (
+                "EXCELLENT" if fit_eval >= 0.7  else
+                "GOOD"      if fit_eval >= 0.4  else
+                "POOR"
+            )
+            print(f"  [Quality] {quality} | Coarse Fitness={fit_eval:.4f} | Final RMSE improved {rmse_improvement:.1f}% vs RANSAC")
+            if fit_eval < 0.05:
+                print(f"  [WARNING] Step {i}: ICP fitness is very low ({fit_eval:.4f})! "
                       f"This step's alignment is likely incorrect and WILL corrupt all subsequent steps. "
                       f"Consider adjusting parameters or checking if all PLY files are valid.")
+            elif fit_eval < 0.4:
+                print(f"  [WARNING] Step {i}: ICP fitness is low ({fit_eval:.4f}). "
+                      f"Result may be inaccurate. Try enabling Accumulative mode or reducing Voxel Size.")
             
             # Extract the relationship matrix to shift the position between i and i-1 to store
             T_local = icp_result.transformation 

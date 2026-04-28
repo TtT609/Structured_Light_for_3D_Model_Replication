@@ -111,6 +111,10 @@ class ScannerGUI:
         self.merge_final_voxel = tk.DoubleVar(value=0.5) # Final overlapping point reduction
         # Checkbox: toggle step-by-step 3D preview popup (blocks merge between steps until window closed)
         self.merge_show_preview = tk.BooleanVar(value=False)
+        # Checkbox: accumulative mode — align each scan against full merged cloud instead of previous scan only
+        self.merge_accum_mode = tk.BooleanVar(value=False)
+        # Checkbox: ICP fine pass — run a second tighter ICP after the coarse ICP for sub-voxel precision
+        self.merge_icp_fine_pass = tk.BooleanVar(value=True)
         # Preview colour-coding: previous (accumulated) cloud and newly added cloud
         self.merge_prev_color = [0.8, 0.2, 0.2]   # default: red  (RGB 0-1)
         self.merge_new_color  = [0.2, 0.9, 0.3]   # default: green (RGB 0-1)
@@ -674,7 +678,38 @@ class ScannerGUI:
     
     def setup_merge_tab(self):
         # Tab 3: Align models then merge into one single form
-        root = self.tab_merge
+        main_frame = self.tab_merge
+        
+        canvas = tk.Canvas(main_frame, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(main_frame, orient="vertical", command=canvas.yview)
+        
+        root = ttk.Frame(canvas)
+        
+        root.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        
+        frame_id = canvas.create_window((0, 0), window=root, anchor="nw")
+        
+        def on_canvas_configure(e):
+            canvas.itemconfig(frame_id, width=e.width)
+            
+        canvas.bind("<Configure>", on_canvas_configure)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        
+        def _on_mousewheel(event):
+            try:
+                if self.notebook.select() == str(self.tab_merge):
+                    canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+            except Exception:
+                pass
+                
+        canvas.bind_all("<MouseWheel>", _on_mousewheel, add="+")
+        
         ttk.Label(root, text="Step 3: 360 Degree Merge (Multi-view Alignment)", font=("Arial", 14, "bold")).pack(pady=10)
         
         lf_files = ttk.LabelFrame(root, text="Files")
@@ -727,6 +762,40 @@ class ScannerGUI:
         ttk.Label(f_fvx, text="Final Voxel Size (mm) [0 = Disable]:").pack(side=tk.LEFT)
         ttk.Entry(f_fvx, textvariable=self.merge_final_voxel, width=10).pack(side=tk.LEFT, padx=5)
         ttk.Label(f_fvx, text="(Merges overlapping points perfectly. Default 0.5. Set 0 to keep true 100% cloud)", foreground="#555").pack(side=tk.LEFT)
+
+        # --- Accumulative Merge Mode ---
+        lf_accum = ttk.LabelFrame(lf_param, text="Registration Target")
+        lf_accum.pack(fill=tk.X, padx=5, pady=(6, 2))
+
+        f_accum = ttk.Frame(lf_accum); f_accum.pack(fill=tk.X, padx=5, pady=5)
+        ttk.Checkbutton(
+            f_accum,
+            text="Accumulative merge mode",
+            variable=self.merge_accum_mode
+        ).pack(side=tk.LEFT)
+
+        accum_desc = (
+            "OFF (default): Each scan is aligned against only the immediately preceding scan\n"
+            "                  e.g.  step 2 aligns  scan[2]  vs  scan[1]\n"
+            "ON:              Each scan is aligned against the FULL accumulated cloud so far\n"
+            "                  e.g.  step 2 aligns  scan[2]  vs  scan[0]+scan[1]\n"
+            "→ Accumulative gives RANSAC/ICP much more overlap to work with (more robust),\n"
+            "   but each step is slightly slower because the target grows larger."
+        )
+        ttk.Label(lf_accum, text=accum_desc, foreground="#555", justify=tk.LEFT, wraplength=650).pack(padx=5, pady=(0, 4))
+
+        # ICP Fine Pass toggle (inside the same Registration Target sub-panel)
+        f_fine = ttk.Frame(lf_accum); f_fine.pack(fill=tk.X, padx=5, pady=(0, 3))
+        ttk.Checkbutton(
+            f_fine,
+            text="ICP Fine Pass (recommended ON)",
+            variable=self.merge_icp_fine_pass
+        ).pack(side=tk.LEFT)
+        ttk.Label(
+            f_fine,
+            text="  Run a 2nd tighter ICP at 0.4× voxel after coarse ICP for extra sub-voxel precision.",
+            foreground="#555", font=("Arial", 8, "italic")
+        ).pack(side=tk.LEFT, padx=4)
 
         # --- Step Preview Checkbox ---
         lf_preview = ttk.LabelFrame(root, text="Step-by-Step 3D Preview")
@@ -1649,6 +1718,8 @@ class ScannerGUI:
         sample_after = self.merge_sample_after.get()
         final_voxel = self.merge_final_voxel.get()
         show_preview = self.merge_show_preview.get()
+        accum_mode = self.merge_accum_mode.get()
+        icp_fine_pass = self.merge_icp_fine_pass.get()
         
         if not in_dir or not out_file:
             messagebox.showerror("Error", "Select Input Folder and Output File.")
@@ -1729,7 +1800,9 @@ class ScannerGUI:
                     outlier_nb, outlier_std,
                     sample_before, sample_after,
                     final_voxel,
-                    step_callback=callback  # None = no preview; function = blocking popup per step
+                    step_callback=callback,  # None = no preview; function = blocking popup per step
+                    accum_mode=accum_mode,
+                    icp_fine_pass=icp_fine_pass
                 )
                 self.root.after(0, lambda: messagebox.showinfo("Merge Done", f"Saved merged cloud to:\n{out_file}"))
             except Exception as e:
