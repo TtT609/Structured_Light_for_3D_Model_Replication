@@ -184,7 +184,7 @@ class ScannerGUI:
         self.notebook = ttk.Notebook(root) # Create horizontal tab menu
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         
-        # Create frames for each of the 7 tabs
+        # Create frames for each of the 8 tabs
         self.tab_scan = ttk.Frame(self.notebook)
         self.tab_multiPCP = ttk.Frame(self.notebook)
         self.tab_proc = ttk.Frame(self.notebook)
@@ -193,9 +193,10 @@ class ScannerGUI:
         self.tab_turntable = ttk.Frame(self.notebook) 
         self.tab_recon = ttk.Frame(self.notebook)
         self.tab_calib_check = ttk.Frame(self.notebook)
+        self.tab_ply_inspect = ttk.Frame(self.notebook)
         
         
-        # Add frames to the menu with headings 1-7
+        # Add frames to the menu with headings 1-9
         self.notebook.add(self.tab_scan, text="1. Scan & Generate")
         self.notebook.add(self.tab_multiPCP, text="2. Multi .ply process")
         self.notebook.add(self.tab_proc, text="3. Cleanup & Process")
@@ -204,6 +205,7 @@ class ScannerGUI:
         self.notebook.add(self.tab_turntable, text="6. Auto-Scan 360")
         self.notebook.add(self.tab_recon, text="7. STL Reconstruction")
         self.notebook.add(self.tab_calib_check, text="8. Calib Check")
+        self.notebook.add(self.tab_ply_inspect, text="9. PLY Inspector")
         
         
         # Initialize UI components for each tab
@@ -215,6 +217,7 @@ class ScannerGUI:
         self.setup_turntable_tab()
         self.setup_stl_tab()
         self.setup_calib_check_tab()
+        self.setup_ply_inspect_tab()
 
     # ==========================================
     # GUI Layout Functions for Each Tab
@@ -1227,9 +1230,371 @@ class ScannerGUI:
         
         ttk.Button(root, text="Show 3D Visualization", command=self.do_show_calib_3d).pack(fill=tk.X, padx=20, pady=20)
 
+    def setup_ply_inspect_tab(self):
+        """Tab 9: PLY Inspector — check ASCII vs Binary, convert to binary."""
+        main_frame = self.tab_ply_inspect
+
+        canvas   = tk.Canvas(main_frame, highlightthickness=0)
+        scrollb  = ttk.Scrollbar(main_frame, orient="vertical", command=canvas.yview)
+        root     = ttk.Frame(canvas)
+        root.bind("<Configure>",
+                  lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        fid = canvas.create_window((0, 0), window=root, anchor="nw")
+        canvas.bind("<Configure>", lambda e: canvas.itemconfig(fid, width=e.width))
+        canvas.configure(yscrollcommand=scrollb.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollb.pack(side="right", fill="y")
+
+        def _mwheel(ev):
+            try:
+                if self.notebook.select() == str(self.tab_ply_inspect):
+                    canvas.yview_scroll(int(-1 * (ev.delta / 120)), "units")
+            except Exception:
+                pass
+        canvas.bind_all("<MouseWheel>", _mwheel, add="+")
+
+        ttk.Label(root, text="PLY Inspector & Binary Converter",
+                  font=("Arial", 14, "bold")).pack(pady=10)
+        ttk.Label(root,
+                  text="Inspect PLY files to check their format (ASCII or Binary),\n"
+                       "then optionally convert ASCII files to compact Binary_little_endian format.",
+                  foreground="#555", justify=tk.CENTER).pack(pady=(0, 6))
+
+        # ── 1. Input source ──────────────────────────────────────────────────
+        lf_src = ttk.LabelFrame(root, text="1. Input Source")
+        lf_src.pack(fill=tk.X, padx=10, pady=6)
+
+        self.pinsp_mode = tk.StringVar(value="folder")  # 'folder' | 'file'
+        f_radio = ttk.Frame(lf_src); f_radio.pack(fill=tk.X, padx=5, pady=4)
+        ttk.Radiobutton(f_radio, text="Folder  (scan all .ply inside)",
+                        variable=self.pinsp_mode, value="folder",
+                        command=self._pinsp_toggle_mode).pack(side=tk.LEFT, padx=6)
+        ttk.Radiobutton(f_radio, text="Single File",
+                        variable=self.pinsp_mode, value="file",
+                        command=self._pinsp_toggle_mode).pack(side=tk.LEFT, padx=6)
+
+        # Folder row
+        self._pinsp_f_folder = ttk.Frame(lf_src)
+        self._pinsp_f_folder.pack(fill=tk.X, padx=5, pady=2)
+        self.pinsp_folder = tk.StringVar()
+        ttk.Button(self._pinsp_f_folder, text="Select Folder",
+                   command=lambda: self.sel_dir(self.pinsp_folder)).pack(side=tk.LEFT)
+        ttk.Entry(self._pinsp_f_folder, textvariable=self.pinsp_folder).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+
+        # File row (hidden by default)
+        self._pinsp_f_file = ttk.Frame(lf_src)
+        self.pinsp_file = tk.StringVar()
+        ttk.Button(self._pinsp_f_file, text="Select .PLY File",
+                   command=lambda: self.sel_file_load(self.pinsp_file, "PLY")).pack(side=tk.LEFT)
+        ttk.Entry(self._pinsp_f_file, textvariable=self.pinsp_file).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+
+        ttk.Button(lf_src, text="🔍  Inspect PLY Files",
+                   command=self.do_ply_inspect).pack(fill=tk.X, padx=10, pady=8)
+
+        # ── 2. Results table ─────────────────────────────────────────────────
+        lf_res = ttk.LabelFrame(root, text="2. Inspection Results")
+        lf_res.pack(fill=tk.BOTH, expand=True, padx=10, pady=6)
+
+        # Header row
+        hdr = ttk.Frame(lf_res); hdr.pack(fill=tk.X, padx=4, pady=(4, 0))
+        ttk.Label(hdr, text="Format",  width=10, font=("Arial", 9, "bold"),
+                  foreground="#333").pack(side=tk.LEFT, padx=2)
+        ttk.Label(hdr, text="Size",    width=10, font=("Arial", 9, "bold"),
+                  foreground="#333").pack(side=tk.LEFT, padx=2)
+        ttk.Label(hdr, text="Points",  width=10, font=("Arial", 9, "bold"),
+                  foreground="#333").pack(side=tk.LEFT, padx=2)
+        ttk.Label(hdr, text="File Path", font=("Arial", 9, "bold"),
+                  foreground="#333").pack(side=tk.LEFT, padx=2)
+        ttk.Separator(lf_res, orient="horizontal").pack(fill=tk.X, padx=4, pady=2)
+
+        # Scrollable results area
+        res_canvas  = tk.Canvas(lf_res, highlightthickness=0, height=180)
+        res_scroll  = ttk.Scrollbar(lf_res, orient="vertical", command=res_canvas.yview)
+        self._pinsp_results_frame = ttk.Frame(res_canvas)
+        self._pinsp_results_frame.bind(
+            "<Configure>",
+            lambda e: res_canvas.configure(scrollregion=res_canvas.bbox("all")))
+        res_canvas.create_window((0, 0), window=self._pinsp_results_frame, anchor="nw")
+        res_canvas.configure(yscrollcommand=res_scroll.set)
+        res_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        res_canvas.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+
+        # Summary label
+        self.pinsp_summary = tk.StringVar(value="No files inspected yet.")
+        ttk.Label(lf_res, textvariable=self.pinsp_summary,
+                  foreground="#0066CC", font=("Arial", 9, "italic")).pack(pady=(2, 4))
+
+        # ── 3. Convert to Binary ─────────────────────────────────────────────
+        lf_conv = ttk.LabelFrame(root, text="3. Convert ASCII → Binary")
+        lf_conv.pack(fill=tk.X, padx=10, pady=6)
+
+        conv_desc = (
+            "Converts ASCII PLY files to Binary_little_endian format.\n"
+            "Binary PLY files load ~10× faster and are 30-50% smaller on disk.\n"
+            "The original file is overwritten in-place (a .bak backup is kept alongside it)."
+        )
+        ttk.Label(lf_conv, text=conv_desc, foreground="#555",
+                  justify=tk.LEFT, wraplength=640).pack(padx=8, pady=(4, 2))
+
+        # Output mode
+        self.pinsp_conv_mode = tk.StringVar(value="inplace")  # 'inplace' | 'folder'
+        f_cmode = ttk.Frame(lf_conv); f_cmode.pack(fill=tk.X, padx=8, pady=4)
+        ttk.Radiobutton(f_cmode, text="Overwrite in-place  (keep .bak backup)",
+                        variable=self.pinsp_conv_mode, value="inplace",
+                        command=self._pinsp_toggle_conv).pack(side=tk.LEFT, padx=6)
+        ttk.Radiobutton(f_cmode, text="Save to output folder",
+                        variable=self.pinsp_conv_mode, value="folder",
+                        command=self._pinsp_toggle_conv).pack(side=tk.LEFT, padx=6)
+
+        self._pinsp_f_outdir = ttk.Frame(lf_conv)
+        self.pinsp_outdir = tk.StringVar()
+        ttk.Button(self._pinsp_f_outdir, text="Select Output Folder",
+                   command=lambda: self.sel_dir(self.pinsp_outdir)).pack(side=tk.LEFT)
+        ttk.Entry(self._pinsp_f_outdir, textvariable=self.pinsp_outdir).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+
+        # Scope selector
+        self.pinsp_conv_scope = tk.StringVar(value="ascii_only")
+        f_scope = ttk.Frame(lf_conv); f_scope.pack(fill=tk.X, padx=8, pady=2)
+        ttk.Label(f_scope, text="Convert:").pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Radiobutton(f_scope, text="ASCII files only (from results above)",
+                        variable=self.pinsp_conv_scope, value="ascii_only").pack(side=tk.LEFT, padx=4)
+        ttk.Radiobutton(f_scope, text="All PLY files in source",
+                        variable=self.pinsp_conv_scope, value="all").pack(side=tk.LEFT, padx=4)
+
+        ttk.Button(lf_conv, text="⚙  Convert to Binary",
+                   command=self.do_ply_convert).pack(fill=tk.X, padx=10, pady=8)
+
+        # Store inspected results for conversion use
+        self._pinsp_last_results = []   # list of dicts: {path, fmt, size, points}
+
+    # ── PLY Inspector helpers ─────────────────────────────────────────────────
+
+    def _pinsp_toggle_mode(self):
+        if self.pinsp_mode.get() == "folder":
+            self._pinsp_f_file.pack_forget()
+            self._pinsp_f_folder.pack(fill=tk.X, padx=5, pady=2)
+        else:
+            self._pinsp_f_folder.pack_forget()
+            self._pinsp_f_file.pack(fill=tk.X, padx=5, pady=2)
+
+    def _pinsp_toggle_conv(self):
+        if self.pinsp_conv_mode.get() == "folder":
+            self._pinsp_f_outdir.pack(fill=tk.X, padx=8, pady=(0, 4))
+        else:
+            self._pinsp_f_outdir.pack_forget()
+
+    @staticmethod
+    def _ply_detect(path):
+        """Return (format_str, num_points) by reading the PLY header only.
+        format_str is one of: 'ascii', 'binary_little_endian', 'binary_big_endian', 'unknown'
+        """
+        fmt    = "unknown"
+        npts   = 0
+        try:
+            with open(path, "rb") as f:
+                for _ in range(30):       # header is never more than 30 lines
+                    raw = f.readline()
+                    if not raw:
+                        break
+                    line = raw.decode("utf-8", errors="replace").strip()
+                    if line.startswith("format "):
+                        parts = line.split()
+                        fmt = parts[1] if len(parts) >= 2 else "unknown"
+                    elif line.startswith("element vertex"):
+                        parts = line.split()
+                        npts = int(parts[2]) if len(parts) >= 3 else 0
+                    elif line == "end_header":
+                        break
+        except Exception:
+            pass
+        return fmt, npts
+
+    def do_ply_inspect(self):
+        """Scan source for .ply files, detect format, and populate results table."""
+        import glob, os
+
+        mode = self.pinsp_mode.get()
+        if mode == "folder":
+            src = self.pinsp_folder.get().strip()
+            if not src or not os.path.isdir(src):
+                messagebox.showerror("Error", "Please select a valid folder.")
+                return
+            files = sorted(glob.glob(os.path.join(src, "*.ply")))
+            if not files:
+                messagebox.showinfo("Info", "No .ply files found in the selected folder.")
+                return
+        else:
+            src = self.pinsp_file.get().strip()
+            if not src or not os.path.isfile(src):
+                messagebox.showerror("Error", "Please select a valid .ply file.")
+                return
+            files = [src]
+
+        # Clear previous results
+        for w in self._pinsp_results_frame.winfo_children():
+            w.destroy()
+        self._pinsp_last_results = []
+
+        popup = self._make_progress_popup(
+            f"Inspecting {len(files)} PLY file(s)…", total_steps=len(files))
+        log  = popup["log_cb"]
+        step = popup["step_cb"]
+        stop = popup["stop_event"]
+
+        def run():
+            results = []
+            for idx, path in enumerate(files, 1):
+                if stop.is_set():
+                    log("Stopped by user.")
+                    self._close_progress_popup(popup)
+                    return
+                fmt, npts = self._ply_detect(path)
+                size_bytes = os.path.getsize(path)
+                size_str = (f"{size_bytes/1024/1024:.2f} MB" if size_bytes >= 1_048_576
+                            else f"{size_bytes/1024:.1f} KB")
+                results.append({"path": path, "fmt": fmt,
+                                 "size": size_str, "points": npts})
+                log(f"[{idx}/{len(files)}] {os.path.basename(path)}  →  {fmt}  |  {npts:,} pts  |  {size_str}")
+                step(idx, len(files))
+
+            self._pinsp_last_results = results
+
+            # Build result rows on main thread
+            def build_rows():
+                for r in results:
+                    row  = ttk.Frame(self._pinsp_results_frame)
+                    row.pack(fill=tk.X, padx=2, pady=1)
+
+                    if r["fmt"] == "ascii":
+                        fg, badge = "#C0392B", "ASCII  ⚠"
+                    elif "binary" in r["fmt"]:
+                        fg, badge = "#27AE60", "BINARY ✓"
+                    else:
+                        fg, badge = "#888888", "UNKNOWN"
+
+                    tk.Label(row, text=badge, width=12, fg=fg,
+                             font=("Consolas", 9, "bold"),
+                             bg="#f0f0f0", relief="groove").pack(side=tk.LEFT, padx=2)
+                    tk.Label(row, text=r["size"], width=10,
+                             font=("Consolas", 9)).pack(side=tk.LEFT, padx=2)
+                    tk.Label(row, text=f"{r['points']:,}", width=12,
+                             font=("Consolas", 9)).pack(side=tk.LEFT, padx=2)
+                    tk.Label(row, text=r["path"],
+                             font=("Consolas", 9), anchor="w").pack(
+                                 side=tk.LEFT, fill=tk.X, expand=True, padx=2)
+
+                ascii_n  = sum(1 for r in results if r["fmt"] == "ascii")
+                binary_n = sum(1 for r in results if "binary" in r["fmt"])
+                self.pinsp_summary.set(
+                    f"{len(results)} file(s) scanned  —  "
+                    f"{binary_n} Binary ✓  |  {ascii_n} ASCII ⚠"
+                )
+            self.root.after(0, build_rows)
+
+            log(f"Done — {len(results)} file(s) inspected.")
+            self._close_progress_popup(popup)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def do_ply_convert(self):
+        """Convert ASCII PLY files to binary_little_endian using open3d."""
+        import os, shutil
+
+        results = self._pinsp_last_results
+        scope   = self.pinsp_conv_scope.get()
+        conv_mode = self.pinsp_conv_mode.get()
+
+        if not results:
+            messagebox.showerror("Error",
+                "No inspection results found.\nPlease run 'Inspect PLY Files' first.")
+            return
+
+        if scope == "ascii_only":
+            targets = [r for r in results if r["fmt"] == "ascii"]
+        else:
+            targets = list(results)
+
+        if not targets:
+            messagebox.showinfo("Nothing to do",
+                "No ASCII PLY files found in the inspection results.")
+            return
+
+        if conv_mode == "folder":
+            out_dir = self.pinsp_outdir.get().strip()
+            if not out_dir:
+                messagebox.showerror("Error",
+                    "Please select an output folder for the converted files.")
+                return
+            os.makedirs(out_dir, exist_ok=True)
+        else:
+            out_dir = None   # in-place
+
+        popup = self._make_progress_popup(
+            f"Converting {len(targets)} PLY file(s) to Binary…",
+            total_steps=len(targets))
+        log  = popup["log_cb"]
+        step = popup["step_cb"]
+        stop = popup["stop_event"]
+
+        def run():
+            try:
+                import open3d as o3d
+            except ImportError:
+                self._close_progress_popup(popup, success=False,
+                    message="open3d is required for conversion.\npip install open3d")
+                return
+
+            ok_count = 0
+            for idx, r in enumerate(targets, 1):
+                if stop.is_set():
+                    log("Stopped by user.")
+                    self._close_progress_popup(popup)
+                    return
+
+                src_path = r["path"]
+                if out_dir:
+                    dst_path = os.path.join(out_dir, os.path.basename(src_path))
+                else:
+                    dst_path = src_path  # overwrite in-place
+
+                try:
+                    log(f"[{idx}/{len(targets)}] Loading: {os.path.basename(src_path)}")
+                    pcd = o3d.io.read_point_cloud(src_path)
+
+                    if not out_dir:
+                        # Backup original
+                        bak = src_path + ".bak"
+                        shutil.copy2(src_path, bak)
+                        log(f"  Backup saved: {os.path.basename(bak)}")
+
+                    o3d.io.write_point_cloud(
+                        dst_path, pcd,
+                        write_ascii=False,           # force binary
+                        compressed=False,
+                        print_progress=False)
+                    old_sz = r["size"]
+                    new_sz_b = os.path.getsize(dst_path)
+                    new_sz = (f"{new_sz_b/1024/1024:.2f} MB"
+                              if new_sz_b >= 1_048_576 else f"{new_sz_b/1024:.1f} KB")
+                    log(f"  ✓ Done  {old_sz} → {new_sz}  |  {dst_path}")
+                    ok_count += 1
+                except Exception as e:
+                    log(f"  ✗ Error: {e}")
+
+                step(idx, len(targets))
+
+            self._close_progress_popup(popup, success=True,
+                message=f"Conversion complete!\n{ok_count}/{len(targets)} file(s) converted to binary.")
+
+        threading.Thread(target=run, daemon=True).start()
+
     # ==========================================
     # Button command functions section (Actions and Helper Actions)
     # ==========================================
+
 
     def update_stl_params(self, event=None):
         # Function to toggle feature menus in Tab 6 depending on mode (Watertight/Surface)
