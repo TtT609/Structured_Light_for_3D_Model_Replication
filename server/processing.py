@@ -508,7 +508,7 @@ class ProcessingLogic:
         return result
 
     @staticmethod
-    def merge_pro_360(input_folder, output_path, voxel_size=0.02, icp_dist_ratio=1.5, outlier_nb=20, outlier_std=2.0, sample_before=1, sample_after=1, final_voxel=0.5, step_callback=None, accum_mode=False, icp_fine_pass=True):
+    def merge_pro_360(input_folder, output_path, voxel_size=0.02, icp_dist_ratio=1.5, outlier_nb=20, outlier_std=2.0, sample_before=1, sample_after=1, final_voxel=0.5, step_callback=None, accum_mode=False, icp_fine_pass=True, stop_check=None):
         # Main function to sequence and merge 3D models obtained from a 360-degree scan (multiple angles) together
         # step_callback: optional function(step_index, total_steps, prev_cloud, new_cloud)
         #                called after each merge step.
@@ -582,6 +582,10 @@ class ProcessingLogic:
         
         # Loop to compare and connect models pair by pair (or against full accumulated cloud)
         for i in range(1, len(pcds)):
+            if stop_check and stop_check():
+                print("[Merge 360] Aborted by user.")
+                return
+            
             source = pcds[i]      # Latest model (moving towards target)
 
             if accum_mode:

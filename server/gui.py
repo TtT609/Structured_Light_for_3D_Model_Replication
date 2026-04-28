@@ -2274,6 +2274,15 @@ class ScannerGUI:
             messagebox.showerror("Error", "Select Input Folder and Output File.")
             return
 
+        popup = self._make_progress_popup("Merging 360° Point Clouds…")
+        log   = popup["log_cb"]
+        step  = popup["step_cb"]
+        stop  = popup["stop_event"]
+
+        log(f"Input folder: {in_dir}")
+        log(f"Output file:  {out_file}")
+        log(f"Voxel={vx}  ICP-dist={icp_dist}  accum={accum_mode}  fine={icp_fine_pass}")
+
         # --- Step preview callback ---
         # Called from the merge thread after each step with:
         #   step_index   : which step just finished (1-based)
@@ -2334,21 +2343,20 @@ class ScannerGUI:
             else:
                 opt.light_on = False  # Pure flat colour — no shading
 
-            vis.run()          # blocks until user closes the window
+            import time
+            while True:
+                if not vis.poll_events():
+                    break
+                vis.update_renderer()
+                if stop.is_set():
+                    break
+                time.sleep(0.01)
+                
             vis.destroy_window()
             print(f"[Preview] Window closed, continuing to next step...")
 
         # Only attach the callback when the checkbox is ticked
         callback = step_preview_callback if show_preview else None
-
-        popup = self._make_progress_popup("Merging 360° Point Clouds…")
-        log   = popup["log_cb"]
-        step  = popup["step_cb"]
-        stop  = popup["stop_event"]
-
-        log(f"Input folder: {in_dir}")
-        log(f"Output file:  {out_file}")
-        log(f"Voxel={vx}  ICP-dist={icp_dist}  accum={accum_mode}  fine={icp_fine_pass}")
 
         # Wrap the step_preview_callback to also log into popup
         original_callback = callback
@@ -2370,7 +2378,8 @@ class ScannerGUI:
                     final_voxel,
                     step_callback=effective_callback,
                     accum_mode=accum_mode,
-                    icp_fine_pass=icp_fine_pass
+                    icp_fine_pass=icp_fine_pass,
+                    stop_check=stop.is_set
                 )
                 if stop.is_set():
                     self._close_progress_popup(popup)
