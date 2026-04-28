@@ -1358,80 +1358,239 @@ class ScannerGUI:
         except:
             pass # Failsafe just in case it's called before GUI builds
 
+    # ==========================================
+    # Progress Popup Helpers
+    # ==========================================
+
+    def _make_progress_popup(self, title, total_steps=None):
+        """Create a modal progress popup with log area and Stop button.
+
+        Returns a dict:
+          'top'        – tk.Toplevel window
+          'log_cb'     – callable(msg): appends timestamped line to popup log
+          'step_cb'    – callable(current, total): advances determinate bar
+          'stop_event' – threading.Event; set when user clicks Stop
+        """
+        import datetime
+        stop_event = threading.Event()
+
+        top = tk.Toplevel(self.root)
+        top.title(title)
+        top.resizable(True, True)
+        top.protocol("WM_DELETE_WINDOW", lambda: None)   # disable × close
+        top.grab_set()   # modal – block parent window
+
+        # Centre over the parent
+        top.update_idletasks()
+        pw, ph = self.root.winfo_width(), self.root.winfo_height()
+        px, py = self.root.winfo_x(), self.root.winfo_y()
+        tw, th = 580, 440
+        top.geometry(f"{tw}x{th}+{px + max(0,(pw-tw)//2)}+{py + max(0,(ph-th)//2)}")
+
+        # Header
+        ttk.Label(top, text=title,
+                  font=("Arial", 12, "bold"), wraplength=540).pack(pady=(14, 4))
+
+        status_var = tk.StringVar(value="Starting…")
+        ttk.Label(top, textvariable=status_var,
+                  foreground="#0066CC", font=("Arial", 9)).pack()
+
+        # Progress bar
+        if total_steps and total_steps > 0:
+            pb = ttk.Progressbar(top, maximum=total_steps,
+                                 mode="determinate", length=540)
+        else:
+            pb = ttk.Progressbar(top, mode="indeterminate", length=540)
+        pb.pack(padx=20, pady=8)
+        if total_steps is None:
+            pb.start(10)   # animate
+
+        # Log area
+        lf_log = ttk.LabelFrame(top, text="Progress Log")
+        lf_log.pack(fill=tk.BOTH, expand=True, padx=14, pady=4)
+
+        txt = tk.Text(lf_log, state="disabled", height=9,
+                      wrap="word", font=("Consolas", 9), bg="#f5f5f5")
+        sb_log = ttk.Scrollbar(lf_log, orient="vertical", command=txt.yview)
+        txt.configure(yscrollcommand=sb_log.set)
+        sb_log.pack(side=tk.RIGHT, fill=tk.Y)
+        txt.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+
+        # Stop button
+        def _on_stop():
+            stop_event.set()
+            status_var.set("Stopping… please wait")
+            btn_stop.config(state="disabled", text="Stopping…")
+
+        btn_stop = tk.Button(
+            top, text="■   STOP & CANCEL",
+            command=_on_stop,
+            bg="#C0392B", fg="white",
+            font=("Arial", 10, "bold"),
+            relief="raised", padx=14, pady=6,
+            cursor="hand2"
+        )
+        btn_stop.pack(pady=(4, 14))
+
+        # Callbacks ---------------------------------------------------------
+        def log_cb(msg):
+            ts = datetime.datetime.now().strftime("%H:%M:%S")
+            line = f"[{ts}] {msg}\n"
+            def _do():
+                try:
+                    txt.config(state="normal")
+                    txt.insert(tk.END, line)
+                    txt.see(tk.END)
+                    txt.config(state="disabled")
+                    status_var.set(msg[:90])
+                except Exception:
+                    pass
+            self.root.after(0, _do)
+
+        def step_cb(current, total=None):
+            def _do():
+                try:
+                    if total_steps and total_steps > 0:
+                        pb.config(value=current)
+                    t = total or total_steps
+                    if t:
+                        status_var.set(f"Step {current} / {t}")
+                except Exception:
+                    pass
+            self.root.after(0, _do)
+
+        return {
+            "top":        top,
+            "log_cb":     log_cb,
+            "step_cb":    step_cb,
+            "stop_event": stop_event,
+            "status_var": status_var,
+            "pb":         pb,
+            "btn_stop":   btn_stop,
+        }
+
+    def _close_progress_popup(self, popup, success=None, message=None):
+        """Destroy the popup on the main thread, optionally showing a result dialog."""
+        def _do():
+            try:
+                popup["pb"].stop()
+            except Exception:
+                pass
+            try:
+                top = popup["top"]
+                if top.winfo_exists():
+                    top.grab_release()
+                    top.destroy()
+            except Exception:
+                pass
+            if message:
+                if success:
+                    messagebox.showinfo("Done", message)
+                else:
+                    messagebox.showerror("Error", message)
+        self.root.after(0, _do)
+
     # --- Execution Functions (Threading sections running in parallel to prevent GUI freezing) ---
 
     def do_calib_capture(self):
-        # Receive first step button command: Capture Calibration photos 
+        # Receive first step button command: Capture Calibration photos
         d = self.calib_capture_dir.get()
         n = self.num_poses.get()
-        # Start projecting structured light onto phone screen via Thread, keeping app responsive
-        threading.Thread(target=self.sys.capture_calibration, args=(d, n), daemon=True).start()
+
+        popup = self._make_progress_popup(f"Capturing Calibration Images ({n} poses)…")
+        log = popup["log_cb"]
+        stop = popup["stop_event"]
+
+        def run():
+            try:
+                log(f"Saving to: {d}")
+                log(f"Projecting {n} calibration poses via phone…")
+                self.sys.capture_calibration(d, n)
+                if stop.is_set():
+                    self._close_progress_popup(popup)
+                    return
+                log("Capture complete!")
+                self._close_progress_popup(popup, success=True,
+                    message=f"Calibration images saved to:\n{d}")
+            except Exception as e:
+                log(f"ERROR: {e}")
+                self._close_progress_popup(popup, success=False, message=str(e))
+
+        threading.Thread(target=run, daemon=True).start()
 
     def do_calib_compute(self):
-        # Sub-calibration calculation step
+        # Sub-calibration calculation step — ask for folder first (must be on main thread)
         initial = self.calib_capture_dir.get()
-        if not os.path.exists(initial): initial = os.getcwd()
-        
+        if not os.path.exists(initial):
+            initial = os.getcwd()
         in_dir = filedialog.askdirectory(title="Select Calibration Images Folder", initialdir=initial)
-        if not in_dir: return
-        
+        if not in_dir:
+            return
         self.calib_capture_dir.set(in_dir)
         out_file = os.path.join(in_dir, "calib.mat")
-        
-        threading.Thread(target=self.run_calib_analysis, args=(in_dir, out_file), daemon=True).start()
 
-    def run_calib_analysis(self, in_dir, out_file):
-        try:
-            self.sys_log(f"Analyzing {in_dir}...")
-            # Pull Error Analysis return values
-            errors, available_poses = self.sys.analyze_calibration(in_dir)
-            # Pop up window for user decision on the main thread
-            self.root.after(0, self.prompt_pose_selection, errors, available_poses, in_dir, out_file)
-        except Exception as e:
-            err_msg = str(e)
-            self.sys_log(f"Calib Analysis Error: {err_msg}")
-            self.root.after(0, lambda: messagebox.showerror("Calib Error", err_msg))
+        popup = self._make_progress_popup("Computing Calibration…")
+        log = popup["log_cb"]
+        stop = popup["stop_event"]
 
-    def prompt_pose_selection(self, errors, available_poses, in_dir, out_file):
-        # Show error limits, ask to discard any bad images? 
-        msg = "Calibration Analysis (Error in px):\n\n"
-        for pose, (ce, pe) in errors.items():
-            msg += f"{pose}: Cam={ce:.2f}, Proj={pe:.2f}\n"
-        msg += "\nEnter poses to KEEP (e.g., '1,3,4' OR 'all' for all):"
-        
-        self.sys_log("Displayed pose selection prompt to user.")
-        user_input = simpledialog.askstring("Select Poses", msg, parent=self.root)
-        if not user_input: 
-            self.sys_log("Pose selection cancelled.")
-            return
-        
-        selected_poses = []
-        user_input = user_input.strip()
-        
-        if user_input.lower() == 'all':
-            selected_poses = available_poses
-        else:
-            selected_indices = [x.strip() for x in user_input.split(',')]
-            for idx in selected_indices:
-                name = f"pose_{idx}"
-                if idx.startswith("pose_"): name = idx
-                if name in available_poses: selected_poses.append(name)
-        
-        self.sys_log(f"Selected poses: {', '.join(selected_poses)}")
-        self.sys_log("Starting final calibration calculation. This may take a minute...")
-        # Continue running the Calibration process
-        threading.Thread(target=self.run_calib_final, args=(in_dir, selected_poses, out_file), daemon=True).start()
+        def run():
+            try:
+                log(f"Analyzing images in: {in_dir}")
+                errors, available_poses = self.sys.analyze_calibration(in_dir)
 
-    def run_calib_final(self, in_dir, selected_poses, out_file):
-        try:
-            self.sys.calibrate_final(in_dir, selected_poses, out_file)
-            self.sys_log(f"Calibration successfully saved to {out_file}")
-            self.root.after(0, lambda: messagebox.showinfo("Success", f"Calibration Saved to:\n{out_file}"))
-            self.root.after(0, lambda: self.calib_file.set(out_file)) # Set the selected file into the input field
-        except Exception as e:
-            err_msg = str(e)
-            self.sys_log(f"Calibration Final Error: {err_msg}")
-            self.root.after(0, lambda: messagebox.showerror("Calib Final Error", err_msg))
+                if stop.is_set():
+                    self._close_progress_popup(popup)
+                    return
+
+                # Build pose-error message for user dialog
+                msg = "Calibration Analysis (reprojection error in px):\n\n"
+                for pose, (ce, pe) in errors.items():
+                    msg += f"  {pose}:  Cam={ce:.2f}  Proj={pe:.2f}\n"
+                msg += "\nEnter poses to KEEP (e.g. '1,3,4'  or  'all'):"
+
+                log("Analysis complete — waiting for pose selection…")
+
+                # Pose-selection dialog must run on main thread
+                pose_result = [None]
+                pose_ready  = threading.Event()
+
+                def _ask():
+                    pose_result[0] = simpledialog.askstring(
+                        "Select Poses", msg, parent=popup["top"])
+                    pose_ready.set()
+
+                self.root.after(0, _ask)
+                pose_ready.wait(timeout=300)
+
+                if stop.is_set() or not pose_result[0]:
+                    log("Pose selection cancelled.")
+                    self._close_progress_popup(popup)
+                    return
+
+                user_input = pose_result[0].strip()
+                selected_poses = []
+                if user_input.lower() == "all":
+                    selected_poses = available_poses
+                else:
+                    for idx in [x.strip() for x in user_input.split(",")]:
+                        name = idx if idx.startswith("pose_") else f"pose_{idx}"
+                        if name in available_poses:
+                            selected_poses.append(name)
+
+                log(f"Selected poses: {', '.join(selected_poses)}")
+                log("Running final calibration… this may take a minute.")
+
+                self.sys.calibrate_final(in_dir, selected_poses, out_file)
+                self.root.after(0, lambda: self.calib_file.set(out_file))
+                log(f"Saved → {out_file}")
+                self._close_progress_popup(popup, success=True,
+                    message=f"Calibration saved to:\n{out_file}")
+
+            except Exception as e:
+                log(f"ERROR: {e}")
+                self._close_progress_popup(popup, success=False, message=str(e))
+
+        threading.Thread(target=run, daemon=True).start()
 
     def do_scan_capture(self):
         # Command Scan capture decoding horizontal and vertical patterns
@@ -1439,9 +1598,27 @@ class ScannerGUI:
         name = self.scan_name.get()
         path = os.path.join(base, name)
         self.scan_capture_dir.set(path)
-        
-        self.sys_log(f"Starting Scan Capture for target: {name}")
-        threading.Thread(target=self.sys.capture_scan, args=(path,), daemon=True).start()
+
+        popup = self._make_progress_popup(f"Capturing Scan: '{name}'")
+        log = popup["log_cb"]
+        stop = popup["stop_event"]
+
+        def run():
+            try:
+                log(f"Projecting Gray-code patterns for: {name}")
+                log(f"Saving to: {path}")
+                self.sys.capture_scan(path)
+                if stop.is_set():
+                    self._close_progress_popup(popup)
+                    return
+                log("Scan capture complete!")
+                self._close_progress_popup(popup, success=True,
+                    message=f"Scan images saved to:\n{path}")
+            except Exception as e:
+                log(f"ERROR: {e}")
+                self._close_progress_popup(popup, success=False, message=str(e))
+
+        threading.Thread(target=run, daemon=True).start()
 
 
 
@@ -1511,64 +1688,62 @@ class ScannerGUI:
                 return
 
         self.btn_run_mpcp.config(state="disabled")
-        self.mpcp_log(
-            f"=== Starting Processing  "
-            f"[col-sets={n_col}  row-sets={n_row}] ==="
-        )
+
+        popup = self._make_progress_popup(
+            f"Generating Point Cloud  [col={n_col}  row={n_row}]")
+        log = popup["log_cb"]
+        stop = popup["stop_event"]
+
+        def combined_log(msg):
+            log(msg)
+            self.mpcp_log(msg)
+
+        combined_log(f"=== Starting Processing [col-sets={n_col}  row-sets={n_row}] ===")
 
         def run():
             try:
+                if stop.is_set():
+                    return
                 if mode == "files":
-                    # Ask where to save the output PLY on the main thread, then decode
                     out_path_holder = [None]
-
+                    save_ev = threading.Event()
                     def _ask_save():
                         p = filedialog.asksaveasfilename(
-                            title="Save PLY as",
-                            defaultextension=".ply",
-                            filetypes=[("PLY files", "*.ply")]
-                        )
+                            title="Save PLY as", defaultextension=".ply",
+                            filetypes=[("PLY files", "*.ply")])
                         out_path_holder[0] = p
-                        save_event.set()
-
-                    import threading as _t
-                    save_event = _t.Event()
+                        save_ev.set()
                     self.root.after(0, _ask_save)
-                    save_event.wait(timeout=120)
-
+                    save_ev.wait(timeout=120)
                     out_path = out_path_holder[0]
                     if not out_path:
-                        self.mpcp_log("Save cancelled.")
+                        combined_log("Save cancelled.")
+                        self._close_progress_popup(popup)
                         return
-
                     self.processor.process_multi_ply(
                         calib, "", "files",
-                        log_callback=self.mpcp_log,
+                        log_callback=combined_log,
                         n_sets_col=n_col, n_sets_row=n_row,
                         row_mode=row_mode, epipolar_tol=ep_tol,
                         thresh_mode=thresh_mode, shadow_val=s_val, contrast_val=c_val,
                         file_list=self.mpcp_selected_files,
-                        out_path_override=out_path
-                    )
+                        out_path_override=out_path)
                 else:
                     self.processor.process_multi_ply(
                         calib, target, folder_mode,
-                        log_callback=self.mpcp_log,
+                        log_callback=combined_log,
                         n_sets_col=n_col, n_sets_row=n_row,
                         row_mode=row_mode, epipolar_tol=ep_tol,
-                        thresh_mode=thresh_mode, shadow_val=s_val, contrast_val=c_val
-                    )
+                        thresh_mode=thresh_mode, shadow_val=s_val, contrast_val=c_val)
 
-                self.root.after(
-                    0, lambda: messagebox.showinfo("Done", "Processing complete!"))
+                combined_log("Processing complete!")
+                self._close_progress_popup(popup, success=True, message="Point cloud generation complete!")
 
             except Exception as e:
-                self.mpcp_log(f"CRITICAL ERROR: {e}")
-                self.root.after(
-                    0, lambda: messagebox.showerror("Error", str(e)))
+                combined_log(f"CRITICAL ERROR: {e}")
+                self._close_progress_popup(popup, success=False, message=str(e))
             finally:
-                self.root.after(
-                    0, lambda: self.btn_run_mpcp.config(state="normal"))
+                self.root.after(0, lambda: self.btn_run_mpcp.config(state="normal"))
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -1576,134 +1751,143 @@ class ScannerGUI:
         # Run Tab 3 — supports both Single-File mode and Folder-Batch mode
         mode = self.proc_mode.get()
 
-        # Check that the user selects at least one cleaning process
         if not any([self.enable_bg_removal.get(), self.enable_outlier_removal.get(),
                     self.enable_radius_outlier.get(), self.enable_cluster.get()]):
             messagebox.showwarning("Warning", "Please enable at least one cleaning step!")
             return
 
-        # ── Helper: run the full cleaning pipeline on a single file path ──────
-        def process_one(path, final_output_path):
-            """Apply the enabled pipeline steps to 'path' and save to 'final_output_path'."""
-            filename = os.path.basename(path)
-            current_data = path  # Start with the raw file path; each step may return an object
-
-            # 1. Statistical Outlier Removal
-            if self.enable_outlier_removal.get():
-                try:
-                    current_data = self.processor.remove_outliers(
-                        input_data=current_data, output_path=None,
-                        nb_neighbors=self.proc_nb_neighbors.get(),
-                        std_ratio=self.proc_std_ratio.get(),
-                        return_obj=True
-                    )
-                except Exception as e:
-                    print(f"[StatOutlier] Error on {filename}: {e}")
-                    return False
-
-            # 2. Keep Largest Cluster (DBSCAN)
-            if self.enable_cluster.get():
-                try:
-                    current_data = self.processor.keep_largest_cluster(
-                        input_data=current_data, output_path=None,
-                        eps=self.proc_cluster_eps.get(),
-                        min_points=self.proc_cluster_min.get(),
-                        return_obj=True
-                    )
-                except Exception as e:
-                    print(f"[Cluster] Error on {filename}: {e}")
-                    return False
-
-            # 3. Radius Outlier Removal
-            if self.enable_radius_outlier.get():
-                try:
-                    current_data = self.processor.remove_radius_outlier(
-                        input_data=current_data, output_path=None,
-                        nb_points=self.proc_radius_nb.get(),
-                        radius=self.proc_radius_r.get(),
-                        return_obj=True
-                    )
-                except Exception as e:
-                    print(f"[RadOutlier] Error on {filename}: {e}")
-                    return False
-
-            # 4. Background Removal (Plane Segmentation)
-            if self.enable_bg_removal.get():
-                try:
-                    current_data = self.processor.remove_background(
-                        input_data=current_data, output_path=None,
-                        distance_threshold=self.bg_dist_thresh.get(),
-                        ransac_n=self.bg_ransac_n.get(),
-                        num_iterations=self.bg_iterations.get(),
-                        return_obj=True
-                    )
-                except Exception as e:
-                    print(f"[BG] Error on {filename}: {e}")
-                    return False
-
-            # Save the result
-            import open3d as o3d
-            import shutil
-            if not isinstance(current_data, str):
-                os.makedirs(os.path.dirname(final_output_path) or ".", exist_ok=True)
-                o3d.io.write_point_cloud(final_output_path, current_data)
-                print(f"[Done] Saved -> {final_output_path}")
-            else:
-                # No step modified the cloud (all disabled); just copy the original
-                os.makedirs(os.path.dirname(final_output_path) or ".", exist_ok=True)
-                shutil.copy(path, final_output_path)
-                print(f"[Copied] -> {final_output_path}")
-            return True
-
-        # ── Single-File mode ─────────────────────────────────────────────────
+        # ── Validate paths ───────────────────────────────────────────────────
         if mode == "file":
             in_file = self.proc_input_file.get()
             out_file = self.proc_output_file.get()
-
             if not in_file or not out_file:
                 messagebox.showerror("Error", "Please select both an Input .PLY file and an Output .PLY file.")
                 return
             if not os.path.isfile(in_file):
                 messagebox.showerror("Error", f"Input file not found:\n{in_file}")
                 return
-
-            def run_file():
-                ok = process_one(in_file, out_file)
-                if ok:
-                    self.root.after(0, lambda: messagebox.showinfo("Done", f"Saved to:\n{out_file}"))
-                else:
-                    self.root.after(0, lambda: messagebox.showerror("Error", "Processing failed. Check console output."))
-
-            threading.Thread(target=run_file, daemon=True).start()
-
-        # ── Folder-Batch mode ────────────────────────────────────────────────
         else:
-            in_dir = self.proc_input_dir.get()
+            in_dir  = self.proc_input_dir.get()
             out_dir = self.proc_output_dir.get()
-
             if not in_dir or not out_dir:
                 messagebox.showerror("Error", "Please select input and output folders.")
                 return
 
-            def run_folder():
+        popup = self._make_progress_popup("Cleanup & Processing Pipeline…")
+        log   = popup["log_cb"]
+        step  = popup["step_cb"]
+        stop  = popup["stop_event"]
+
+        # ── Inner helper: process one file ───────────────────────────────────
+        def process_one(path, final_output_path):
+            filename = os.path.basename(path)
+            current_data = path
+
+            if self.enable_outlier_removal.get():
+                log(f"[{filename}] Statistical outlier removal…")
+                try:
+                    current_data = self.processor.remove_outliers(
+                        input_data=current_data, output_path=None,
+                        nb_neighbors=self.proc_nb_neighbors.get(),
+                        std_ratio=self.proc_std_ratio.get(), return_obj=True)
+                except Exception as e:
+                    log(f"[StatOutlier] Error: {e}"); return False
+
+            if stop.is_set(): return False
+
+            if self.enable_cluster.get():
+                log(f"[{filename}] Largest-cluster filter…")
+                try:
+                    current_data = self.processor.keep_largest_cluster(
+                        input_data=current_data, output_path=None,
+                        eps=self.proc_cluster_eps.get(),
+                        min_points=self.proc_cluster_min.get(), return_obj=True)
+                except Exception as e:
+                    log(f"[Cluster] Error: {e}"); return False
+
+            if stop.is_set(): return False
+
+            if self.enable_radius_outlier.get():
+                log(f"[{filename}] Radius outlier removal…")
+                try:
+                    current_data = self.processor.remove_radius_outlier(
+                        input_data=current_data, output_path=None,
+                        nb_points=self.proc_radius_nb.get(),
+                        radius=self.proc_radius_r.get(), return_obj=True)
+                except Exception as e:
+                    log(f"[RadOutlier] Error: {e}"); return False
+
+            if stop.is_set(): return False
+
+            if self.enable_bg_removal.get():
+                log(f"[{filename}] Background removal…")
+                try:
+                    current_data = self.processor.remove_background(
+                        input_data=current_data, output_path=None,
+                        distance_threshold=self.bg_dist_thresh.get(),
+                        ransac_n=self.bg_ransac_n.get(),
+                        num_iterations=self.bg_iterations.get(), return_obj=True)
+                except Exception as e:
+                    log(f"[BG] Error: {e}"); return False
+
+            import open3d as o3d, shutil
+            if not isinstance(current_data, str):
+                os.makedirs(os.path.dirname(final_output_path) or ".", exist_ok=True)
+                o3d.io.write_point_cloud(final_output_path, current_data)
+                log(f"Saved → {final_output_path}")
+            else:
+                os.makedirs(os.path.dirname(final_output_path) or ".", exist_ok=True)
+                shutil.copy(path, final_output_path)
+                log(f"Copied → {final_output_path}")
+            return True
+
+        # ── Threading ────────────────────────────────────────────────────────
+        if mode == "file":
+            def run():
+                try:
+                    log(f"Processing: {os.path.basename(in_file)}")
+                    ok = process_one(in_file, out_file)
+                    if stop.is_set():
+                        self._close_progress_popup(popup)
+                        return
+                    if ok:
+                        self._close_progress_popup(popup, success=True,
+                            message=f"Saved to:\n{out_file}")
+                    else:
+                        self._close_progress_popup(popup, success=False,
+                            message="Processing failed — check log.")
+                except Exception as e:
+                    log(f"ERROR: {e}")
+                    self._close_progress_popup(popup, success=False, message=str(e))
+            threading.Thread(target=run, daemon=True).start()
+        else:
+            def run():
                 import glob
-                ply_files = glob.glob(os.path.join(in_dir, "*.ply"))
-                if not ply_files:
-                    self.root.after(0, lambda: messagebox.showerror("Error", "No .ply files found in input folder."))
-                    return
-
-                os.makedirs(out_dir, exist_ok=True)
-                success = 0
-                for path in ply_files:
-                    out_path = os.path.join(out_dir, os.path.basename(path))
-                    if process_one(path, out_path):
-                        success += 1
-
-                total = len(ply_files)
-                self.root.after(0, lambda: messagebox.showinfo(
-                    "Done", f"Batch complete: {success}/{total} files processed successfully."))
-
-            threading.Thread(target=run_folder, daemon=True).start()
+                try:
+                    ply_files = glob.glob(os.path.join(in_dir, "*.ply"))
+                    if not ply_files:
+                        self._close_progress_popup(popup, success=False,
+                            message="No .ply files found in input folder.")
+                        return
+                    os.makedirs(out_dir, exist_ok=True)
+                    total = len(ply_files)
+                    success = 0
+                    for idx, path in enumerate(ply_files, 1):
+                        if stop.is_set():
+                            log("Stopped by user.")
+                            self._close_progress_popup(popup)
+                            return
+                        log(f"File {idx}/{total}: {os.path.basename(path)}")
+                        step(idx, total)
+                        out_path = os.path.join(out_dir, os.path.basename(path))
+                        if process_one(path, out_path):
+                            success += 1
+                    self._close_progress_popup(popup, success=True,
+                        message=f"Batch complete: {success}/{total} files processed.")
+                except Exception as e:
+                    log(f"ERROR: {e}")
+                    self._close_progress_popup(popup, success=False, message=str(e))
+            threading.Thread(target=run, daemon=True).start()
 
 
     def do_merge_360(self):
@@ -1792,6 +1976,25 @@ class ScannerGUI:
         # Only attach the callback when the checkbox is ticked
         callback = step_preview_callback if show_preview else None
 
+        popup = self._make_progress_popup("Merging 360° Point Clouds…")
+        log   = popup["log_cb"]
+        step  = popup["step_cb"]
+        stop  = popup["stop_event"]
+
+        log(f"Input folder: {in_dir}")
+        log(f"Output file:  {out_file}")
+        log(f"Voxel={vx}  ICP-dist={icp_dist}  accum={accum_mode}  fine={icp_fine_pass}")
+
+        # Wrap the step_preview_callback to also log into popup
+        original_callback = callback
+        def wrapped_callback(step_index, total_steps, prev_cloud, new_cloud):
+            log(f"Step {step_index}/{total_steps} — opening 3D preview…")
+            step(step_index, total_steps)
+            if original_callback:
+                original_callback(step_index, total_steps, prev_cloud, new_cloud)
+
+        effective_callback = wrapped_callback if show_preview else None
+
         def run():
             try:
                 self.processor.merge_pro_360(
@@ -1800,16 +2003,20 @@ class ScannerGUI:
                     outlier_nb, outlier_std,
                     sample_before, sample_after,
                     final_voxel,
-                    step_callback=callback,  # None = no preview; function = blocking popup per step
+                    step_callback=effective_callback,
                     accum_mode=accum_mode,
                     icp_fine_pass=icp_fine_pass
                 )
-                self.root.after(0, lambda: messagebox.showinfo("Merge Done", f"Saved merged cloud to:\n{out_file}"))
+                if stop.is_set():
+                    self._close_progress_popup(popup)
+                    return
+                log("Merge complete!")
+                self._close_progress_popup(popup, success=True,
+                    message=f"Merged cloud saved to:\n{out_file}")
             except Exception as e:
-                err_msg = str(e)
-                print(err_msg)
-                self.root.after(0, lambda: messagebox.showerror("Error", err_msg))
-        
+                log(f"ERROR: {e}")
+                self._close_progress_popup(popup, success=False, message=str(e))
+
         threading.Thread(target=run, daemon=True).start()
 
     def do_360_meshing(self):
@@ -1842,27 +2049,36 @@ class ScannerGUI:
             messagebox.showerror("Error", "Input .PLY not found.")
             return
 
+        popup = self._make_progress_popup("360° Meshing (Poisson Reconstruction)…")
+        log   = popup["log_cb"]
+        stop  = popup["stop_event"]
+
+        log(f"Input:  {in_file}")
+        log(f"Output: {out_file}")
+        log(f"Depth={depth}  Trim={trim}  Mode={mode}  Threads={p_threads}")
+        log(f"Normals: radius={n_rad}  max_nn={n_max}")
+        if save_normals_path:
+            log(f"Save normals PLY: {save_normals_path}")
+
         def run_thread():
             try:
-                self.sys_log(
-                    f"Starting 360 Meshing (Poisson):\nDepth: {depth}, Trim: {trim}, "
-                    f"Mode: {mode}, Threads: {p_threads}\n"
-                    f"Normals (Rad: {n_rad}, MaxNN: {n_max})"
-                    + (f"\nSave normals PLY: {save_normals_path}" if save_normals_path else "")
-                )
+                log("Estimating normals and running Poisson reconstruction…")
                 self.processor.mesh_360(
                     input_path=in_file, output_path=out_file,
                     depth=depth, density_trim=trim, orientation_mode=mode,
                     width=p_width, scale=p_scale, linear_fit=p_linear, n_threads=p_threads,
                     normal_radius=n_rad, normal_max_nn=n_max,
-                    save_normals_path=save_normals_path   # None = skip saving
+                    save_normals_path=save_normals_path
                 )
-                self.sys_log("360 Meshing complete.")
-                self.root.after(0, lambda: messagebox.showinfo("Done", f"360 Mesh Saved to:\n{out_file}"))
+                if stop.is_set():
+                    self._close_progress_popup(popup)
+                    return
+                log("360 Meshing complete!")
+                self._close_progress_popup(popup, success=True,
+                    message=f"360 Mesh saved to:\n{out_file}")
             except Exception as e:
-                err_msg = str(e)
-                print(f"Error: {e}")
-                self.root.after(0, lambda: messagebox.showerror("Error", err_msg))
+                log(f"ERROR: {e}")
+                self._close_progress_popup(popup, success=False, message=str(e))
 
         threading.Thread(target=run_thread, daemon=True).start()
 
@@ -1908,8 +2124,19 @@ class ScannerGUI:
                 messagebox.showerror("Error", "Please select an output path for the normals .PLY file.")
                 return
 
+        popup = self._make_progress_popup("STL Reconstruction…")
+        log   = popup["log_cb"]
+        stop  = popup["stop_event"]
+
+        log(f"Input:  {i}")
+        log(f"Output: {o}  Mode: {m}")
+        log(f"Centroid orient: {use_centroid}  Consistency: {use_consistency}")
+        if meshlab_params:
+            log("MeshLab post-processing: enabled")
+
         def run():
             try:
+                log("Running reconstruction…")
                 self.processor.reconstruct_stl(
                     i, o, m, params,
                     centroid_orient=use_centroid,
@@ -1918,99 +2145,92 @@ class ScannerGUI:
                     meshlab_params=meshlab_params,
                     save_normals_path=save_normals_path
                 )
-                self.root.after(0, lambda: messagebox.showinfo("Done", f"STL Saved to:\n{o}"))
+                if stop.is_set():
+                    self._close_progress_popup(popup)
+                    return
+                log(f"STL saved → {o}")
+                self._close_progress_popup(popup, success=True,
+                    message=f"STL saved to:\n{o}")
             except Exception as e:
-                err_msg = str(e)
-                self.root.after(0, lambda: messagebox.showerror("Error", err_msg))
+                log(f"ERROR: {e}")
+                self._close_progress_popup(popup, success=False, message=str(e))
 
         threading.Thread(target=run, daemon=True).start()
 
     def do_auto_scan_sequence(self):
-        # Run Tab 5 Turntable auto-scan 
-        
-        # Check Arduino dependency
+        # Run Tab 6 Turntable auto-scan
         if not self.arduino.ser:
-            # If Arduino is not connected, ask if want to continue in Simulation mode
-            if not messagebox.askyesno("Confirm", "Arduino not connected (in software). Continue anyway (Simulation)?"):
+            if not messagebox.askyesno("Confirm",
+                    "Arduino not connected. Continue anyway (Simulation)?"):
                 return
-        
-        deg = self.tt_degrees.get()
-        turns = self.tt_turns.get()
+
+        deg       = self.tt_degrees.get()
+        turns     = self.tt_turns.get()
         base_name = self.tt_base_name.get()
-        root_dir = self.tt_save_dir.get()
-        
+        root_dir  = self.tt_save_dir.get()
+
         if not base_name or not root_dir:
             messagebox.showerror("Error", "Check Output settings"); return
-            
-        # Create Main Folder (Run folder for 360 object)
+
         main_folder = os.path.join(root_dir, f"{base_name}_{int(deg)}deg_AUTO")
         os.makedirs(main_folder, exist_ok=True)
-        
-        # New Popup Progress (Secondary window to notify progress during run)
-        top = tk.Toplevel(self.root)
-        top.title("Auto Scan Progress")
-        top.geometry("400x300")
-        
-        lbl_info = ttk.Label(top, text="Starting...", font=("Arial", 12))
-        lbl_info.pack(pady=20)
-        
-        lbl_time = ttk.Label(top, text="Time: 0s")
-        lbl_time.pack(pady=5)
-        
-        pb = ttk.Progressbar(top, maximum=turns, mode='determinate')
-        pb.pack(fill=tk.X, padx=20, pady=20)
-        
-        # Thread Logic Auto process execution
+
+        popup = self._make_progress_popup(
+            f"Auto-Scan 360°  ({turns} turns × {deg}°)", total_steps=turns)
+        log  = popup["log_cb"]
+        step = popup["step_cb"]
+        stop = popup["stop_event"]
+
+        log(f"Base name:   {base_name}")
+        log(f"Save folder: {main_folder}")
+        log(f"Total turns: {turns}  ({deg}° each)")
+
         def run_thread():
             start_time = time.time()
-            
-            for i in range(turns): # How many turns to cycle through
-                # Update UI (Update UI state displayed on screen)
-                elapsed = time.time() - start_time
-                avg_time = (elapsed / i) if i > 0 else 0
-                rem_time = avg_time * (turns - i)
-                
-                msg = f"Scanning {i+1}/{turns}\nElapsed: {int(elapsed)}s\nEst. Left: {int(rem_time)}s"
-                
-                self.root.after(0, lambda: lbl_info.config(text=msg))
-                self.root.after(0, lambda: lbl_time.config(text=f"Time: {int(elapsed)}s"))
-                self.root.after(0, lambda m=i: pb.config(value=m))
-                
-                # 1. CAPTURE Take burst photos
-                current_angle = i * deg
-                sub_name = f"{base_name}_{int(current_angle)}deg_scan" # Pose sub-name
-                sub_path = os.path.join(main_folder, sub_name)
-                
-                print(f"[Auto] Capturing to {sub_path}")
-                
-                try:
-                    # Input hidden command silent=True to skip popup alerts during projection, keeping it smooth
-                    self.sys.capture_scan(sub_path, silent=True)
-                except Exception as e:
-                    print(f"Scan Error: {e}")
-                    self.root.after(0, lambda: messagebox.showerror("Error", f"Scan failed: {e}"))
+            for i in range(turns):
+                if stop.is_set():
+                    log("Stopped by user.")
+                    self._close_progress_popup(popup)
                     return
 
-                # 2. MOVE rotate the turntable to prepare for the next shot
-                if i < turns - 1: # If not the final loop, command motor to move
-                    msg_move = f"Rotating {deg} degrees..."
-                    self.root.after(0, lambda: lbl_info.config(text=msg_move))
-                    
+                elapsed  = time.time() - start_time
+                avg_time = (elapsed / i) if i > 0 else 0
+                rem_time = avg_time * (turns - i)
+
+                log(f"Scan {i+1}/{turns}  |  elapsed {int(elapsed)}s  |  est. left {int(rem_time)}s")
+                step(i + 1, turns)
+
+                current_angle = i * deg
+                sub_name = f"{base_name}_{int(current_angle)}deg_scan"
+                sub_path = os.path.join(main_folder, sub_name)
+
+                try:
+                    self.sys.capture_scan(sub_path, silent=True)
+                except Exception as e:
+                    log(f"Scan error: {e}")
+                    self._close_progress_popup(popup, success=False,
+                        message=f"Scan failed at step {i+1}:\n{e}")
+                    return
+
+                if i < turns - 1:
+                    if stop.is_set():
+                        log("Stopped by user after capture.")
+                        self._close_progress_popup(popup)
+                        return
+                    log(f"Rotating {deg}°…")
                     if self.arduino.ser:
                         self.arduino.rotate(deg)
-                        # Wait for 'DONE' from Arduino with a 10s timeout, otherwise turntable might be stuck
-                        done = self.arduino.wait_for_done(timeout=10) 
+                        done = self.arduino.wait_for_done(timeout=10)
                         if not done:
-                            print("Warning: Arduino move timeout or no DONE received.")
-                        time.sleep(0.5) # Pause slightly to prevent object vibration
+                            log("Warning: Arduino move timeout.")
+                        time.sleep(0.5)
                     else:
-                        time.sleep(2) # Running simulation as a side test
+                        time.sleep(2)
 
-            # Finish (Wrap up)
             total_time = time.time() - start_time
-            done_msg = f"Auto Scan Complete!\nTotal Time: {int(total_time)}s\nLocation: {main_folder}"
-            self.root.after(0, lambda: messagebox.showinfo("Done", done_msg))
-            self.root.after(0, top.destroy) # Close the ProgressBar window
+            log(f"All {turns} scans complete!  Total time: {int(total_time)}s")
+            self._close_progress_popup(popup, success=True,
+                message=f"Auto Scan Complete!\nTotal Time: {int(total_time)}s\nLocation: {main_folder}")
 
         threading.Thread(target=run_thread, daemon=True).start()
 
