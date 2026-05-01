@@ -177,6 +177,11 @@ class ScannerGUI:
         # --- State Variables (Calib Check) ---
         self.chk_calib_file = tk.StringVar(value=os.path.join(DEFAULT_ROOT, "calib", "calib.mat"))
 
+        # --- State Variables (Manual Merge) ---
+        self.mm_input1 = tk.StringVar()
+        self.mm_input2 = tk.StringVar()
+        self.mm_output = tk.StringVar()
+
         # --- Camera Mode (Web Frontend vs Android Native) ---
         self.camera_mode = tk.StringVar(value="web")  # 'web' or 'android'
 
@@ -194,6 +199,7 @@ class ScannerGUI:
         self.tab_recon = ttk.Frame(self.notebook)
         self.tab_calib_check = ttk.Frame(self.notebook)
         self.tab_ply_inspect = ttk.Frame(self.notebook)
+        self.tab_manual_merge = ttk.Frame(self.notebook)
         
         
         # Add frames to the menu with headings 1-9
@@ -206,6 +212,7 @@ class ScannerGUI:
         self.notebook.add(self.tab_recon, text="7. STL Reconstruction")
         self.notebook.add(self.tab_calib_check, text="8. Calib Check")
         self.notebook.add(self.tab_ply_inspect, text="9. PLY Inspector")
+        self.notebook.add(self.tab_manual_merge, text="10. Manual Merge")
         
         
         # Initialize UI components for each tab
@@ -218,6 +225,7 @@ class ScannerGUI:
         self.setup_stl_tab()
         self.setup_calib_check_tab()
         self.setup_ply_inspect_tab()
+        self.setup_manual_merge_tab()
 
     # ==========================================
     # GUI Layout Functions for Each Tab
@@ -1369,6 +1377,36 @@ class ScannerGUI:
 
         # Store inspected results for conversion use
         self._pinsp_last_results = []   # list of dicts: {path, fmt, size, points}
+
+    def setup_manual_merge_tab(self):
+        root = self.tab_manual_merge
+        ttk.Label(root, text="Step 10: Manual Plane Merge", font=("Arial", 14, "bold")).pack(pady=10)
+        
+        explanation = (
+            "Align two box-shaped point clouds by picking 3 planes on each.\n"
+            "This works by mathematically finding the corner intersection of 3 orthogonal planes.\n"
+            "During the process, a 3D window will pop up 3 times per file. "
+            "Hold Shift + Left Click to pick exactly 3 points per plane, then close the window."
+        )
+        ttk.Label(root, text=explanation, justify=tk.CENTER, foreground="#333", font=("Arial", 9, "italic")).pack(pady=(0, 10))
+        
+        lf_files = ttk.LabelFrame(root, text="Files")
+        lf_files.pack(fill=tk.X, padx=10, pady=5)
+        
+        f_in1 = ttk.Frame(lf_files); f_in1.pack(fill=tk.X, padx=5, pady=5)
+        ttk.Button(f_in1, text="Select File 1 (.ply)", command=lambda: self.sel_file_load(self.mm_input1, "PLY")).pack(side=tk.LEFT)
+        ttk.Entry(f_in1, textvariable=self.mm_input1).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        
+        f_in2 = ttk.Frame(lf_files); f_in2.pack(fill=tk.X, padx=5, pady=5)
+        ttk.Button(f_in2, text="Select File 2 (.ply)", command=lambda: self.sel_file_load(self.mm_input2, "PLY")).pack(side=tk.LEFT)
+        ttk.Entry(f_in2, textvariable=self.mm_input2).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        
+        f_out = ttk.Frame(lf_files); f_out.pack(fill=tk.X, padx=5, pady=5)
+        ttk.Button(f_out, text="Select Output (.ply)", command=lambda: self.sel_file_save(self.mm_output, "PLY")).pack(side=tk.LEFT)
+        ttk.Entry(f_out, textvariable=self.mm_output).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        
+        ttk.Button(root, text="▶ START MANUAL PLANE MERGE", command=self.do_manual_plane_merge).pack(fill=tk.X, padx=20, pady=20)
+
 
     # ── PLY Inspector helpers ─────────────────────────────────────────────────
 
@@ -2737,3 +2775,47 @@ class ScannerGUI:
             messagebox.showerror("Graph Error", "Package 'scipy' is required for Euler angle conversion. Ensure it is fully installed.")
         except Exception as e:
             messagebox.showerror("Graph Build Error", str(e))
+
+    def do_manual_plane_merge(self):
+        f1 = self.mm_input1.get().strip()
+        f2 = self.mm_input2.get().strip()
+        out = self.mm_output.get().strip()
+        
+        if not f1 or not f2 or not out:
+            messagebox.showerror("Error", "Please select both input files and an output file.")
+            return
+            
+        if not os.path.isfile(f1) or not os.path.isfile(f2):
+            messagebox.showerror("Error", "Input files must exist.")
+            return
+
+        popup = self._make_progress_popup("Manual Plane Merge (Interactive)")
+        log = popup["log_cb"]
+        stop = popup["stop_event"]
+        
+        def run():
+            try:
+                log(f"Starting manual plane merge.\nFile 1: {f1}\nFile 2: {f2}")
+                log("Please follow the pop-up instructions. Close the 3D window after each picking step.")
+                
+                # We need to run UI/Visualization on the main thread, but we are inside a background thread.
+                # However, Open3D's VisualizerWithEditing works fine if called from a background thread 
+                # as long as it's the only GUI running its own event loop. Let's try it.
+                self.processor.manual_plane_merge(
+                    f1, f2, out, 
+                    log_callback=log, 
+                    stop_check=stop.is_set
+                )
+                
+                if stop.is_set():
+                    self._close_progress_popup(popup)
+                    return
+                
+                self._close_progress_popup(popup, success=True, message=f"Manual plane merge successful!\nSaved to: {out}")
+            except Exception as e:
+                log(f"ERROR: {str(e)}")
+                import traceback
+                log(traceback.format_exc())
+                self._close_progress_popup(popup, success=False, message=str(e))
+                
+        threading.Thread(target=run, daemon=True).start()

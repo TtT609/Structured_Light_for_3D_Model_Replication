@@ -940,10 +940,236 @@ class ProcessingLogic:
         else:
             print("[360 Mesh] Density trim is 0.0 -> Keeping watertight result.")
         
-        # 5. Flush the final surface processing before export
-        mesh.compute_vertex_normals()
-        
         # 6. Save the fully completed model file output as a 3D model (e.g., .stl) display on the computer and clear the calculations left behind
         o3d.io.write_triangle_mesh(output_path, mesh)
         print(f"[360 Mesh] Saved to {output_path}")
+
+    @staticmethod
+    def pick_3_points(pcd, plane_name):
+        """
+        Open Open3D VisualizerWithEditing to let user pick 3 points.
+        Returns the list of 3 point indices.
+        """
+        print(f"[{plane_name}] Please pick 3 points. [Shift + Left Click] to pick, then close window.")
+        vis = o3d.visualization.VisualizerWithEditing()
+        vis.create_window(window_name=f"Pick exactly 3 points for {plane_name}", width=1024, height=768)
+        vis.add_geometry(pcd)
+        vis.run()  # Blocks until window is closed
+        vis.destroy_window()
+        picked_indices = vis.get_picked_points()
+        
+        if len(picked_indices) != 3:
+            raise ValueError(f"You must pick exactly 3 points for {plane_name}. You picked {len(picked_indices)}.")
+            
+        return picked_indices
+
+    @staticmethod
+    def fit_plane_from_3_points(pcd, picked_indices, distance_threshold=2.0):
+        """
+        Given 3 point indices, fit a robust plane.
+        """
+        points = np.asarray(pcd.points)
+        p1 = points[picked_indices[0]]
+        p2 = points[picked_indices[1]]
+        p3 = points[picked_indices[2]]
+        
+        # Calculate normal vector of the 3 points
+        v1 = p2 - p1
+        v2 = p3 - p1
+        n = np.cross(v1, v2)
+        n = n / np.linalg.norm(n)
+        d = -np.dot(n, p1)
+        
+        # Find all points close to this mathematical plane
+        dist = np.abs(np.dot(points, n) + d)
+        candidate_indices = np.where(dist < distance_threshold * 2)[0]
+        
+        if len(candidate_indices) < 10:
+            raise ValueError("Not enough points found near the picked plane.")
+            
+        candidate_cloud = pcd.select_by_index(candidate_indices)
+        
+        # Run RANSAC on these candidates to get a refined plane
+        plane_model, inliers = candidate_cloud.segment_plane(
+            distance_threshold=distance_threshold,
+            ransac_n=3,
+            num_iterations=1000
+        )
+        
+        # Map inliers back to original pcd indices
+        global_inliers = candidate_indices[inliers]
+        
+        # Ensure the normal points towards the origin (camera)
+        n_ref = plane_model[0:3]
+        d_ref = plane_model[3]
+        
+        # Open3D's segment_plane doesn't guarantee normal direction. 
+        # We assume the object is viewed from outside (camera at origin)
+        # So we want the normal to point toward the camera. 
+        # Ray from point to camera is -p. n_ref dot (-p) > 0 -> n_ref dot p < 0
+        centroid = np.mean(points[global_inliers], axis=0)
+        if np.dot(n_ref, centroid) > 0:
+            n_ref = -n_ref
+            d_ref = -d_ref
+            
+        return np.append(n_ref, d_ref), global_inliers
+
+    @staticmethod
+    def manual_plane_merge(file1, file2, out_file, log_callback=None, stop_check=None):
+        def log(msg):
+            if log_callback: log_callback(msg)
+            else: print(msg)
+            
+        pcd1 = o3d.io.read_point_cloud(file1)
+        pcd2 = o3d.io.read_point_cloud(file2)
+        
+        if not pcd1.has_points() or not pcd2.has_points():
+            raise ValueError("One of the input point clouds is empty.")
+            
+        # Give them default colors if they don't have them
+        if not pcd1.has_colors(): pcd1.paint_uniform_color([0.8, 0.8, 0.8])
+        if not pcd2.has_colors(): pcd2.paint_uniform_color([0.8, 0.8, 0.8])
+        
+        pcd1_working = copy.deepcopy(pcd1)
+        pcd2_working = copy.deepcopy(pcd2)
+        
+        planes1 = []
+        planes2 = []
+        picked_pts1 = []
+        picked_pts2 = []
+        
+        # Process File 1
+        for plane_name in ["Plane A1", "Plane B1", "Plane C1"]:
+            if stop_check and stop_check(): return
+            idx = ProcessingLogic.pick_3_points(pcd1_working, plane_name)
+            plane_eq, inliers = ProcessingLogic.fit_plane_from_3_points(pcd1_working, idx)
+            planes1.append(plane_eq)
+            for i in idx:
+                picked_pts1.append(np.asarray(pcd1_working.points)[i])
+            
+            # Color the found plane so user knows it worked
+            np.asarray(pcd1_working.colors)[inliers] = [1.0, 0, 0] # Red
+            log(f"{plane_name} normal: [{plane_eq[0]:.2f}, {plane_eq[1]:.2f}, {plane_eq[2]:.2f}]")
+            
+        # Process File 2
+        for plane_name in ["Plane A2", "Plane B2", "Plane C2"]:
+            if stop_check and stop_check(): return
+            idx = ProcessingLogic.pick_3_points(pcd2_working, plane_name)
+            plane_eq, inliers = ProcessingLogic.fit_plane_from_3_points(pcd2_working, idx)
+            planes2.append(plane_eq)
+            for i in idx:
+                picked_pts2.append(np.asarray(pcd2_working.points)[i])
+            
+            # Color the found plane
+            np.asarray(pcd2_working.colors)[inliers] = [0, 1.0, 0] # Green
+            log(f"{plane_name} normal: [{plane_eq[0]:.2f}, {plane_eq[1]:.2f}, {plane_eq[2]:.2f}]")
+            
+        # Find corner 1
+        A1 = np.array([p[0:3] for p in planes1])
+        B1 = np.array([-p[3] for p in planes1])
+        try:
+            corner1 = np.linalg.solve(A1, B1)
+        except np.linalg.LinAlgError:
+            corner1 = np.array([np.inf, np.inf, np.inf])
+            
+        # Find corner 2
+        A2 = np.array([p[0:3] for p in planes2])
+        B2 = np.array([-p[3] for p in planes2])
+        try:
+            corner2 = np.linalg.solve(A2, B2)
+        except np.linalg.LinAlgError:
+            corner2 = np.array([np.inf, np.inf, np.inf])
+            
+        log(f"Corner 1: {corner1}")
+        log(f"Corner 2: {corner2}")
+        
+        # Find Rotation Matrix using SVD over all permutations and sign flips
+        # This handles the user picking planes in any order, and normal direction ambiguity
+        best_trace = -1
+        best_R = np.identity(3)
+        
+        import itertools
+        for perm in itertools.permutations([0, 1, 2]):
+            for signs in itertools.product([1, -1], repeat=3):
+                A2_mod = np.array([A2[perm[0]] * signs[0], 
+                                   A2[perm[1]] * signs[1], 
+                                   A2[perm[2]] * signs[2]])
+                H = np.dot(A2_mod.T, A1)
+                U, S, Vt = np.linalg.svd(H)
+                R = np.dot(Vt.T, U.T)
+                
+                if np.linalg.det(R) > 0:
+                    trace = np.sum(S)
+                    if trace > best_trace:
+                        best_trace = trace
+                        best_R = R
+                        
+        # Check if corners are stable
+        stable_corners = True
+        if np.isinf(corner1[0]) or np.isinf(corner2[0]):
+            stable_corners = False
+        elif abs(np.linalg.det(A1)) < 0.1 or abs(np.linalg.det(A2)) < 0.1:
+            stable_corners = False
+        else:
+            bbox_size = np.linalg.norm(pcd1.get_max_bound() - pcd1.get_min_bound())
+            if np.linalg.norm(corner1 - pcd1.get_center()) > bbox_size * 2:
+                stable_corners = False
+                
+        if stable_corners:
+            log("Using computed corners for translation alignment.")
+            T = corner1 - np.dot(best_R, corner2)
+        else:
+            log("Warning: Planes are nearly parallel or corner is too far. Using picked point centroids for translation instead.")
+            c1 = np.mean(picked_pts1, axis=0)
+            c2 = np.mean(picked_pts2, axis=0)
+            T = c1 - np.dot(best_R, c2)
+        
+        # Build 4x4 transform
+        transform = np.identity(4)
+        transform[0:3, 0:3] = best_R
+        transform[0:3, 3] = T
+        
+        log("Initial Alignment Transform:")
+        log(str(transform))
+        
+        # Apply transform to pcd2
+        pcd2.transform(transform)
+        
+        # Run ICP to refine
+        log("Refining with ICP...")
+        
+        # Estimate normals for ICP
+        pcd1.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=2.0, max_nn=30))
+        pcd2.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=2.0, max_nn=30))
+        
+        bbox_size = np.linalg.norm(pcd1.get_max_bound() - pcd1.get_min_bound())
+        icp_dist_coarse = bbox_size * 0.1
+        icp_dist_fine = bbox_size * 0.02
+        
+        # Coarse pass (Point-to-Point)
+        icp_coarse = o3d.pipelines.registration.registration_icp(
+            pcd2, pcd1, icp_dist_coarse, np.identity(4),
+            o3d.pipelines.registration.TransformationEstimationPointToPoint()
+        )
+        
+        # Fine pass (Point-to-Plane)
+        icp_result = o3d.pipelines.registration.registration_icp(
+            pcd2, pcd1, icp_dist_fine, icp_coarse.transformation,
+            o3d.pipelines.registration.TransformationEstimationPointToPlane()
+        )
+        
+        log(f"ICP Fitness: {icp_result.fitness:.4f}")
+        log(f"ICP RMSE: {icp_result.inlier_rmse:.6f}")
+        
+        pcd2.transform(icp_result.transformation)
+        
+        # Combine
+        pcd_combined = pcd1 + pcd2
+        
+        # Downsample to remove perfect duplicates
+        pcd_combined = pcd_combined.voxel_down_sample(voxel_size=0.5)
+        
+        log(f"Saving merged point cloud to {out_file}")
+        o3d.io.write_point_cloud(out_file, pcd_combined)
+
 
