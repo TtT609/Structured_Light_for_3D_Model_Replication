@@ -181,6 +181,8 @@ class ScannerGUI:
         self.mm_input1 = tk.StringVar()
         self.mm_input2 = tk.StringVar()
         self.mm_output = tk.StringVar()
+        self.mm_enable_icp = tk.BooleanVar(value=True)
+        self.mm_match_mode = tk.StringVar(value="3")
 
         # --- Camera Mode (Web Frontend vs Android Native) ---
         self.camera_mode = tk.StringVar(value="web")  # 'web' or 'android'
@@ -1404,6 +1406,18 @@ class ScannerGUI:
         f_out = ttk.Frame(lf_files); f_out.pack(fill=tk.X, padx=5, pady=5)
         ttk.Button(f_out, text="Select Output (.ply)", command=lambda: self.sel_file_save(self.mm_output, "PLY")).pack(side=tk.LEFT)
         ttk.Entry(f_out, textvariable=self.mm_output).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        
+        lf_params = ttk.LabelFrame(root, text="Merge Settings")
+        lf_params.pack(fill=tk.X, padx=10, pady=5)
+        
+        f_mode = ttk.Frame(lf_params); f_mode.pack(fill=tk.X, padx=5, pady=5)
+        ttk.Label(f_mode, text="Match Mode:").pack(side=tk.LEFT, padx=(0, 5))
+        cb_mode = ttk.Combobox(f_mode, textvariable=self.mm_match_mode, values=["3", "2"], state="readonly", width=5)
+        cb_mode.pack(side=tk.LEFT)
+        ttk.Label(f_mode, text="(3 = Exact Corner, 2 = Edge Align + ICP Slide)", foreground="#555").pack(side=tk.LEFT, padx=5)
+        
+        f_icp = ttk.Frame(lf_params); f_icp.pack(fill=tk.X, padx=5, pady=5)
+        ttk.Checkbutton(f_icp, text="Run ICP Refinement after plane alignment", variable=self.mm_enable_icp).pack(side=tk.LEFT)
         
         ttk.Button(root, text="▶ START MANUAL PLANE MERGE", command=self.do_manual_plane_merge).pack(fill=tk.X, padx=20, pady=20)
 
@@ -2804,7 +2818,9 @@ class ScannerGUI:
                 self.processor.manual_plane_merge(
                     f1, f2, out, 
                     log_callback=log, 
-                    stop_check=stop.is_set
+                    stop_check=stop.is_set,
+                    enable_icp=self.mm_enable_icp.get(),
+                    match_mode=self.mm_match_mode.get()
                 )
                 
                 if stop.is_set():

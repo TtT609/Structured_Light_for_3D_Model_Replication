@@ -1015,7 +1015,7 @@ class ProcessingLogic:
         return np.append(n_ref, d_ref), global_inliers
 
     @staticmethod
-    def manual_plane_merge(file1, file2, out_file, log_callback=None, stop_check=None):
+    def manual_plane_merge(file1, file2, out_file, log_callback=None, stop_check=None, enable_icp=True, match_mode="3"):
         def log(msg):
             if log_callback: log_callback(msg)
             else: print(msg)
@@ -1038,47 +1038,62 @@ class ProcessingLogic:
         picked_pts1 = []
         picked_pts2 = []
         
+        # Determine how many planes to pick
+        plane_names = ["Plane A", "Plane B", "Plane C"] if match_mode == "3" else ["Plane A", "Plane B"]
+        
         # Process File 1
-        for plane_name in ["Plane A1", "Plane B1", "Plane C1"]:
+        for i, plane_name in enumerate(plane_names):
             if stop_check and stop_check(): return
-            idx = ProcessingLogic.pick_3_points(pcd1_working, plane_name)
+            idx = ProcessingLogic.pick_3_points(pcd1_working, f"{plane_name}1")
             plane_eq, inliers = ProcessingLogic.fit_plane_from_3_points(pcd1_working, idx)
             planes1.append(plane_eq)
-            for i in idx:
-                picked_pts1.append(np.asarray(pcd1_working.points)[i])
+            for j in idx:
+                picked_pts1.append(np.asarray(pcd1_working.points)[j])
             
-            # Color the found plane so user knows it worked
             np.asarray(pcd1_working.colors)[inliers] = [1.0, 0, 0] # Red
-            log(f"{plane_name} normal: [{plane_eq[0]:.2f}, {plane_eq[1]:.2f}, {plane_eq[2]:.2f}]")
+            log(f"{plane_name}1 normal: [{plane_eq[0]:.2f}, {plane_eq[1]:.2f}, {plane_eq[2]:.2f}]")
             
         # Process File 2
-        for plane_name in ["Plane A2", "Plane B2", "Plane C2"]:
+        for i, plane_name in enumerate(plane_names):
             if stop_check and stop_check(): return
-            idx = ProcessingLogic.pick_3_points(pcd2_working, plane_name)
+            idx = ProcessingLogic.pick_3_points(pcd2_working, f"{plane_name}2")
             plane_eq, inliers = ProcessingLogic.fit_plane_from_3_points(pcd2_working, idx)
             planes2.append(plane_eq)
-            for i in idx:
-                picked_pts2.append(np.asarray(pcd2_working.points)[i])
+            for j in idx:
+                picked_pts2.append(np.asarray(pcd2_working.points)[j])
             
-            # Color the found plane
             np.asarray(pcd2_working.colors)[inliers] = [0, 1.0, 0] # Green
-            log(f"{plane_name} normal: [{plane_eq[0]:.2f}, {plane_eq[1]:.2f}, {plane_eq[2]:.2f}]")
+            log(f"{plane_name}2 normal: [{plane_eq[0]:.2f}, {plane_eq[1]:.2f}, {plane_eq[2]:.2f}]")
             
         # Find corner 1
         A1 = np.array([p[0:3] for p in planes1])
         B1 = np.array([-p[3] for p in planes1])
-        try:
-            corner1 = np.linalg.solve(A1, B1)
-        except np.linalg.LinAlgError:
+        if match_mode == "3":
+            try:
+                corner1 = np.linalg.solve(A1, B1)
+            except np.linalg.LinAlgError:
+                corner1 = np.array([np.inf, np.inf, np.inf])
+        else:
             corner1 = np.array([np.inf, np.inf, np.inf])
+            # Construct dummy 3rd plane for rotation matching
+            n3_1 = np.cross(A1[0], A1[1])
+            n3_1 /= (np.linalg.norm(n3_1) + 1e-8)
+            A1 = np.vstack([A1, n3_1])
             
         # Find corner 2
         A2 = np.array([p[0:3] for p in planes2])
         B2 = np.array([-p[3] for p in planes2])
-        try:
-            corner2 = np.linalg.solve(A2, B2)
-        except np.linalg.LinAlgError:
+        if match_mode == "3":
+            try:
+                corner2 = np.linalg.solve(A2, B2)
+            except np.linalg.LinAlgError:
+                corner2 = np.array([np.inf, np.inf, np.inf])
+        else:
             corner2 = np.array([np.inf, np.inf, np.inf])
+            # Construct dummy 3rd plane for rotation matching
+            n3_2 = np.cross(A2[0], A2[1])
+            n3_2 /= (np.linalg.norm(n3_2) + 1e-8)
+            A2 = np.vstack([A2, n3_2])
             
         log(f"Corner 1: {corner1}")
         log(f"Corner 2: {corner2}")
@@ -1135,33 +1150,36 @@ class ProcessingLogic:
         # Apply transform to pcd2
         pcd2.transform(transform)
         
-        # Run ICP to refine
-        log("Refining with ICP...")
-        
-        # Estimate normals for ICP
-        pcd1.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=2.0, max_nn=30))
-        pcd2.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=2.0, max_nn=30))
-        
-        bbox_size = np.linalg.norm(pcd1.get_max_bound() - pcd1.get_min_bound())
-        icp_dist_coarse = bbox_size * 0.1
-        icp_dist_fine = bbox_size * 0.02
-        
-        # Coarse pass (Point-to-Point)
-        icp_coarse = o3d.pipelines.registration.registration_icp(
-            pcd2, pcd1, icp_dist_coarse, np.identity(4),
-            o3d.pipelines.registration.TransformationEstimationPointToPoint()
-        )
-        
-        # Fine pass (Point-to-Plane)
-        icp_result = o3d.pipelines.registration.registration_icp(
-            pcd2, pcd1, icp_dist_fine, icp_coarse.transformation,
-            o3d.pipelines.registration.TransformationEstimationPointToPlane()
-        )
-        
-        log(f"ICP Fitness: {icp_result.fitness:.4f}")
-        log(f"ICP RMSE: {icp_result.inlier_rmse:.6f}")
-        
-        pcd2.transform(icp_result.transformation)
+        if enable_icp:
+            # Run ICP to refine
+            log("Refining with ICP...")
+            
+            # Estimate normals for ICP
+            pcd1.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=2.0, max_nn=30))
+            pcd2.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=2.0, max_nn=30))
+            
+            bbox_size = np.linalg.norm(pcd1.get_max_bound() - pcd1.get_min_bound())
+            icp_dist_coarse = bbox_size * 0.1
+            icp_dist_fine = bbox_size * 0.02
+            
+            # Coarse pass (Point-to-Point)
+            icp_coarse = o3d.pipelines.registration.registration_icp(
+                pcd2, pcd1, icp_dist_coarse, np.identity(4),
+                o3d.pipelines.registration.TransformationEstimationPointToPoint()
+            )
+            
+            # Fine pass (Point-to-Plane)
+            icp_result = o3d.pipelines.registration.registration_icp(
+                pcd2, pcd1, icp_dist_fine, icp_coarse.transformation,
+                o3d.pipelines.registration.TransformationEstimationPointToPlane()
+            )
+            
+            log(f"ICP Fitness: {icp_result.fitness:.4f}")
+            log(f"ICP RMSE: {icp_result.inlier_rmse:.6f}")
+            
+            pcd2.transform(icp_result.transformation)
+        else:
+            log("ICP refinement skipped.")
         
         # Combine
         pcd_combined = pcd1 + pcd2
