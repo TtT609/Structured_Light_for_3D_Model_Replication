@@ -165,6 +165,12 @@ class ScannerGUI:
         self.s_save_normals = tk.BooleanVar(value=False)        # Enable/disable saving the normals PLY
         self.s_normals_out = tk.StringVar()                     # Path for the normals output PLY
 
+        # --- State Variables (Unified Meshing & Reconstruction tab) ---
+        # Normal orientation mode: 'radial', 'tangent', or 'centroid'
+        self.unified_normal_mode = tk.StringVar(value="radial")
+        # Reconstruction backend: 'poisson' (watertight) or 'ball_pivot' (surface)
+        self.unified_recon_method = tk.StringVar(value="poisson")
+
         # --- State Variables (Turntable) ---
         self.tt_port = tk.StringVar() # COM Port selection
         self.tt_baud = tk.StringVar(value="115200") # Connection speed
@@ -191,40 +197,35 @@ class ScannerGUI:
         self.notebook = ttk.Notebook(root) # Create horizontal tab menu
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         
-        # Create frames for each of the 8 tabs
+        # Create frames for each of the 9 tabs
         self.tab_scan = ttk.Frame(self.notebook)
         self.tab_multiPCP = ttk.Frame(self.notebook)
         self.tab_proc = ttk.Frame(self.notebook)
         self.tab_merge = ttk.Frame(self.notebook)
-        self.tab_mesh360 = ttk.Frame(self.notebook) 
-        self.tab_turntable = ttk.Frame(self.notebook) 
-        self.tab_recon = ttk.Frame(self.notebook)
+        self.tab_mesh360 = ttk.Frame(self.notebook)   # unified Meshing & Reconstruction
+        self.tab_turntable = ttk.Frame(self.notebook)
         self.tab_calib_check = ttk.Frame(self.notebook)
         self.tab_ply_inspect = ttk.Frame(self.notebook)
         self.tab_manual_merge = ttk.Frame(self.notebook)
-        
-        
-        # Add frames to the menu with headings 1-9
-        self.notebook.add(self.tab_scan, text="1. Scan & Generate")
-        self.notebook.add(self.tab_multiPCP, text="2. Multi .ply process")
-        self.notebook.add(self.tab_proc, text="3. Cleanup & Process")
-        self.notebook.add(self.tab_merge, text="4. Merge 360")
-        self.notebook.add(self.tab_mesh360, text="5. 360 Meshing")
-        self.notebook.add(self.tab_turntable, text="6. Auto-Scan 360")
-        self.notebook.add(self.tab_recon, text="7. STL Reconstruction")
-        self.notebook.add(self.tab_calib_check, text="8. Calib Check")
-        self.notebook.add(self.tab_ply_inspect, text="9. PLY Inspector")
-        self.notebook.add(self.tab_manual_merge, text="10. Manual Merge")
-        
-        
+
+        # Add frames to the menu
+        self.notebook.add(self.tab_scan,         text="1. Scan & Generate")
+        self.notebook.add(self.tab_multiPCP,     text="2. Multi .ply process")
+        self.notebook.add(self.tab_proc,         text="3. Cleanup & Process")
+        self.notebook.add(self.tab_merge,        text="4. Merge 360")
+        self.notebook.add(self.tab_mesh360,      text="5. Meshing & Reconstruction")
+        self.notebook.add(self.tab_turntable,    text="6. Auto-Scan 360")
+        self.notebook.add(self.tab_calib_check,  text="7. Calib Check")
+        self.notebook.add(self.tab_ply_inspect,  text="8. PLY Inspector")
+        self.notebook.add(self.tab_manual_merge, text="9. Manual Merge")
+
         # Initialize UI components for each tab
         self.setup_scan_tab()
         self.setup_multiPCP_tab()
         self.setup_processing_tab()
         self.setup_merge_tab()
-        self.setup_360_meshing_tab()
+        self.setup_360_meshing_tab()   # unified meshing tab (replaces old Tab 5 + Tab 7)
         self.setup_turntable_tab()
-        self.setup_stl_tab()
         self.setup_calib_check_tab()
         self.setup_ply_inspect_tab()
         self.setup_manual_merge_tab()
@@ -887,105 +888,211 @@ class ScannerGUI:
         ttk.Button(root, text="Merge 360 Point Clouds", command=self.do_merge_360).pack(fill=tk.X, padx=20, pady=20)
 
     def setup_360_meshing_tab(self):
-        # Tab 4: Mesh stitching surface coating exclusively for 360 degree 3D models
-        root = self.tab_mesh360
-        ttk.Label(root, text="Step 4: 360 Meshing (Poisson + Normal Re-orientation)", font=("Arial", 14, "bold")).pack(pady=5)
-        
-        # Explanation Text Block
-        explanation = (
-            "This tab uses 'Screened Poisson Surface Reconstruction' to wrap a watertight 3D mesh \n"
-            "over your point cloud. Unique to 360 Meshing, it calculates the 'Normal' direction of every \n"
-            "point and attempts to flip them all outwards so that the model doesn't render inside-out.\n"
-            "If you see bubbling artifacts, it means the Normal vectors were calculated incorrectly. \n"
-            "Adjusting the Normal Estimation Search Radius can help fix these bubbles."
-        )
-        ttk.Label(root, text=explanation, justify=tk.CENTER, foreground="#333", font=("Arial", 9, "italic")).pack(pady=(0, 10))
-        
-        lf_files = ttk.LabelFrame(root, text="Files")
+        # Tab 5 (unified): Meshing & Reconstruction — scrollable canvas
+        main_frame = self.tab_mesh360
+
+        canvas = tk.Canvas(main_frame, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(main_frame, orient="vertical", command=canvas.yview)
+        root = ttk.Frame(canvas)
+        root.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        frame_id = canvas.create_window((0, 0), window=root, anchor="nw")
+        canvas.bind("<Configure>", lambda e: canvas.itemconfig(frame_id, width=e.width))
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        def _on_mousewheel(event):
+            try:
+                if self.notebook.select() == str(self.tab_mesh360):
+                    canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+            except Exception:
+                pass
+        canvas.bind_all("<MouseWheel>", _on_mousewheel, add="+")
+
+        ttk.Label(root, text="Meshing & Reconstruction  (PLY → STL)", font=("Arial", 14, "bold")).pack(pady=(8, 2))
+
+        ttk.Label(root,
+            text="Convert a point cloud (.PLY) into a 3D mesh (.STL).\n"
+                 "Select your normal orientation method, reconstruction algorithm, and optional post-processing below.",
+            foreground="#444", font=("Arial", 9, "italic"), justify=tk.CENTER).pack(pady=(0, 8))
+
+        # ── 1. Files ──────────────────────────────────────────────────────────
+        lf_files = ttk.LabelFrame(root, text="1. Files")
         lf_files.pack(fill=tk.X, padx=10, pady=5)
-        
+
         f_in = ttk.Frame(lf_files); f_in.pack(fill=tk.X, padx=5, pady=5)
-        ttk.Button(f_in, text="Select Input .PLY", command=lambda: self.sel_file_load(self.m360_input_ply, "PLY")).pack(side=tk.LEFT)
+        ttk.Button(f_in, text="Select Input .PLY",
+                   command=lambda: self.sel_file_load(self.m360_input_ply, "PLY")).pack(side=tk.LEFT)
         ttk.Entry(f_in, textvariable=self.m360_input_ply).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
-        
+
         f_out = ttk.Frame(lf_files); f_out.pack(fill=tk.X, padx=5, pady=5)
-        ttk.Button(f_out, text="Select Output .STL", command=lambda: self.sel_file_save(self.m360_output_stl, "STL")).pack(side=tk.LEFT)
+        ttk.Button(f_out, text="Select Output .STL",
+                   command=lambda: self.sel_file_save(self.m360_output_stl, "STL")).pack(side=tk.LEFT)
         ttk.Entry(f_out, textvariable=self.m360_output_stl).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
-        
-        lf_param = ttk.LabelFrame(root, text="Parameters")
-        lf_param.pack(fill=tk.X, padx=10, pady=5)
-        
-        # Select mesh stitching direction (Radial, Tangent)
-        f_m = ttk.Frame(lf_param); f_m.pack(fill=tk.X, padx=5, pady=2)
-        ttk.Label(f_m, text="Orientation Mode:").pack(side=tk.LEFT)
-        # Dropdown Combobox for user selection
-        ttk.Combobox(f_m, textvariable=self.m360_mode, values=["radial", "tangent"], state="readonly", width=10).pack(side=tk.LEFT, padx=5)
-        ttk.Label(f_m, text="(Radial = Outwards from center | Tangent = Graph consistency)", foreground="#555").pack(side=tk.LEFT)
 
-        f_nr = ttk.Frame(lf_param); f_nr.pack(fill=tk.X, padx=5, pady=2)
-        ttk.Label(f_nr, text="Normal Search Radius [Default 0.1]:").pack(side=tk.LEFT)
-        ttk.Entry(f_nr, textvariable=self.m360_normal_radius, width=10).pack(side=tk.LEFT, padx=5)
-        ttk.Label(f_nr, text="(Increase if you see bubbles/inverted surfaces)", foreground="#555").pack(side=tk.LEFT)
+        # ── 2. Normal Vector Orientation ──────────────────────────────────────
+        lf_norm = ttk.LabelFrame(root, text="2. Normal Vector Orientation  (choose one)")
+        lf_norm.pack(fill=tk.X, padx=10, pady=5)
 
-        f_nn = ttk.Frame(lf_param); f_nn.pack(fill=tk.X, padx=5, pady=2)
-        ttk.Label(f_nn, text="Normal Max Neighbors [Default 30]:").pack(side=tk.LEFT)
-        ttk.Entry(f_nn, textvariable=self.m360_normal_max_nn, width=10).pack(side=tk.LEFT, padx=5)
-
-        f_d = ttk.Frame(lf_param); f_d.pack(fill=tk.X, padx=5, pady=2)
-        ttk.Label(f_d, text="Poisson Depth [Default 10]:").pack(side=tk.LEFT)
-        ttk.Entry(f_d, textvariable=self.m360_depth, width=10).pack(side=tk.LEFT, padx=5)
-        ttk.Label(f_d, text="(Max octree depth. Higher = more detail but slower. >12 may freeze PC.)", foreground="#555").pack(side=tk.LEFT)
-        
-        f_w = ttk.Frame(lf_param); f_w.pack(fill=tk.X, padx=5, pady=2)
-        ttk.Label(f_w, text="Target Width [Default 0.0]:").pack(side=tk.LEFT)
-        ttk.Entry(f_w, textvariable=self.m360_width, width=10).pack(side=tk.LEFT, padx=5)
-        ttk.Label(f_w, text="(Finest level octree cell size. Leave 0.0 to rely on Depth instead.)", foreground="#555").pack(side=tk.LEFT)
-        
-        f_s = ttk.Frame(lf_param); f_s.pack(fill=tk.X, padx=5, pady=2)
-        ttk.Label(f_s, text="Scale Ratio [Default 1.1]:").pack(side=tk.LEFT)
-        ttk.Entry(f_s, textvariable=self.m360_scale, width=10).pack(side=tk.LEFT, padx=5)
-        ttk.Label(f_s, text="(Ratio of reconstruction bounding box to sample bounding box.)", foreground="#555").pack(side=tk.LEFT)
-
-        f_lf = ttk.Frame(lf_param); f_lf.pack(fill=tk.X, padx=5, pady=2)
-        ttk.Checkbutton(f_lf, text="Linear Fit Interpolation", variable=self.m360_linear_fit).pack(side=tk.LEFT)
-        ttk.Label(f_lf, text="(Toggle on to use linear fitting instead of default cubic interpolation.)", foreground="#555").pack(side=tk.LEFT)
-
-        f_th = ttk.Frame(lf_param); f_th.pack(fill=tk.X, padx=5, pady=2)
-        ttk.Label(f_th, text="Number Threads [Default -1]:").pack(side=tk.LEFT)
-        ttk.Entry(f_th, textvariable=self.m360_threads, width=10).pack(side=tk.LEFT, padx=5)
-        ttk.Label(f_th, text="(-1 = Auto/All CPU Cores)", foreground="#555").pack(side=tk.LEFT)
-
-        f_t = ttk.Frame(lf_param); f_t.pack(fill=tk.X, padx=5, pady=2)
-        ttk.Label(f_t, text="Density Trim [0.0 = Watertight]:").pack(side=tk.LEFT)
-        ttk.Entry(f_t, textvariable=self.m360_trim, width=10).pack(side=tk.LEFT, padx=5)
-        ttk.Label(f_t, text="(>0.0 trims external overlapping bubbles)", foreground="#555").pack(side=tk.LEFT)
-
-        # ── Save Normals PLY checkbox ────────────────────────────────────────────
-        lf_save_normals = ttk.LabelFrame(root, text="Save Normals Point Cloud")
-        lf_save_normals.pack(fill=tk.X, padx=10, pady=5)
-
-        f_sn_cb = ttk.Frame(lf_save_normals); f_sn_cb.pack(fill=tk.X, padx=5, pady=4)
-        ttk.Checkbutton(
-            f_sn_cb,
-            text="Save point cloud with normals after orientation step (as .PLY)",
-            variable=self.m360_save_normals
-        ).pack(side=tk.LEFT)
-
-        f_sn_path = ttk.Frame(lf_save_normals); f_sn_path.pack(fill=tk.X, padx=5, pady=4)
-        ttk.Button(
-            f_sn_path, text="Select Output .PLY",
-            command=lambda: self.sel_file_save(self.m360_normals_out, "PLY")
-        ).pack(side=tk.LEFT)
-        ttk.Entry(f_sn_path, textvariable=self.m360_normals_out).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
-
-        sn_desc = (
-            "When checked, the point cloud (with estimated normal vectors embedded) is saved to\n"
-            "the chosen .PLY file BEFORE the Poisson meshing step runs.\n"
-            "Useful for inspecting or debugging the normal orientation result separately."
+        norm_intro = (
+            "Normals define which direction each point 'faces'. Getting them right prevents inside-out surfaces.\n"
+            "Radial/Tangent estimate normals from the cloud geometry; Centroid forces all normals away from the "
+            "cloud's geometric center."
         )
-        ttk.Label(lf_save_normals, text=sn_desc, foreground="#555", justify=tk.LEFT, wraplength=620).pack(padx=5, pady=(0, 5))
+        ttk.Label(lf_norm, text=norm_intro, foreground="#555", justify=tk.LEFT, wraplength=650).pack(padx=8, pady=(4, 2))
 
-        ttk.Button(root, text="Run 360 Meshing", command=self.do_360_meshing).pack(fill=tk.X, padx=20, pady=20)
+        f_norm_radios = ttk.Frame(lf_norm); f_norm_radios.pack(fill=tk.X, padx=8, pady=4)
+        ttk.Radiobutton(f_norm_radios,
+            text="Radial  — orients all normals outward from the cloud centre (best for 360° scans)",
+            variable=self.unified_normal_mode, value="radial",
+            command=self._update_unified_norm_ui).grid(row=0, column=0, sticky="w", pady=2)
+        ttk.Radiobutton(f_norm_radios,
+            text="Tangent  — graph-consistency orient (better for complex/open shapes)",
+            variable=self.unified_normal_mode, value="tangent",
+            command=self._update_unified_norm_ui).grid(row=1, column=0, sticky="w", pady=2)
+        ttk.Radiobutton(f_norm_radios,
+            text="Centroid  — geometric-centre orient + optional neighbourhood consistency pass",
+            variable=self.unified_normal_mode, value="centroid",
+            command=self._update_unified_norm_ui).grid(row=2, column=0, sticky="w", pady=2)
+
+        # Normal estimation params — shown for Radial/Tangent
+        self._frm_norm_est = ttk.Frame(lf_norm)
+        f_nr = ttk.Frame(self._frm_norm_est); f_nr.pack(fill=tk.X, padx=12, pady=2)
+        ttk.Label(f_nr, text="Normal Search Radius  [Default 0.1]:", width=32).pack(side=tk.LEFT)
+        ttk.Entry(f_nr, textvariable=self.m360_normal_radius, width=10).pack(side=tk.LEFT, padx=5)
+        ttk.Label(f_nr, text="(Increase if you see bubbles / inverted surfaces)", foreground="#555").pack(side=tk.LEFT)
+        f_nn = ttk.Frame(self._frm_norm_est); f_nn.pack(fill=tk.X, padx=12, pady=2)
+        ttk.Label(f_nn, text="Normal Max Neighbors  [Default 30]:", width=32).pack(side=tk.LEFT)
+        ttk.Entry(f_nn, textvariable=self.m360_normal_max_nn, width=10).pack(side=tk.LEFT, padx=5)
+        ttk.Label(f_nn, text="(Max neighbours used when estimating each normal)", foreground="#555").pack(side=tk.LEFT)
+
+        # Centroid params — shown for Centroid
+        self._frm_centroid = ttk.Frame(lf_norm)
+        ttk.Label(self._frm_centroid,
+            text="    Forces all normals to face away from the geometric centre of the whole cloud.\n"
+                 "    ✔ Best for closed objects scanned from all sides.",
+            foreground="#555", justify=tk.LEFT).pack(anchor=tk.W, padx=12, pady=(2, 4))
+        f_cp = ttk.Frame(self._frm_centroid); f_cp.pack(fill=tk.X, padx=12, pady=2)
+        ttk.Checkbutton(f_cp,
+            text="Consistency Pass  (propagates outward direction through neighbourhood graph after centroid orient)",
+            variable=self.s_consistency_pass).pack(side=tk.LEFT)
+        f_cpk = ttk.Frame(self._frm_centroid); f_cpk.pack(fill=tk.X, padx=12, pady=2)
+        ttk.Label(f_cpk, text="    Neighbours (k)  [Default 30]:", width=28).pack(side=tk.LEFT)
+        ttk.Entry(f_cpk, textvariable=self.s_consistency_k, width=8).pack(side=tk.LEFT, padx=5)
+        ttk.Label(f_cpk, text="(20–50 typical. Higher k = more influence per point, slower)",
+                  foreground="#555").pack(side=tk.LEFT)
+        ttk.Label(self._frm_centroid,
+            text="    ⚠ On very noisy clouds the consistency pass may re-flip some correct normals — use with care.",
+            foreground="#886600", justify=tk.LEFT).pack(anchor=tk.W, padx=12, pady=(0, 4))
+
+        self._update_unified_norm_ui()   # set initial visibility
+
+        # ── 3. Reconstruction Method ──────────────────────────────────────────
+        lf_recon = ttk.LabelFrame(root, text="3. Reconstruction Method  (choose one)")
+        lf_recon.pack(fill=tk.X, padx=10, pady=5)
+
+        f_recon_r = ttk.Frame(lf_recon); f_recon_r.pack(fill=tk.X, padx=8, pady=4)
+        ttk.Radiobutton(f_recon_r,
+            text="Poisson Surface Reconstruction  (watertight closed mesh — recommended for 360° scans)",
+            variable=self.unified_recon_method, value="poisson",
+            command=self._update_unified_recon_ui).grid(row=0, column=0, sticky="w", pady=2)
+        ttk.Radiobutton(f_recon_r,
+            text="Ball-Pivoting Reconstruction  (open surface mesh — good for partial/organic shapes; requires Centroid orientation)",
+            variable=self.unified_recon_method, value="ball_pivot",
+            command=self._update_unified_recon_ui).grid(row=1, column=0, sticky="w", pady=2)
+
+        # Poisson params frame
+        self._frm_poisson = ttk.Frame(lf_recon)
+        for lbl, var, hint in [
+            ("Poisson Depth  [Default 10]:",    self.m360_depth,    "(Octree depth — higher = more detail but slower; >12 may freeze)"),
+            ("Target Width  [Default 0.0]:",    self.m360_width,    "(Finest octree cell size — leave 0.0 to use Depth instead)"),
+            ("Scale Ratio  [Default 1.1]:",     self.m360_scale,    "(Ratio of reconstruction bounding box to sample bounding box)"),
+            ("Threads  [Default -1]:",           self.m360_threads,  "(-1 = auto / all CPU cores)"),
+            ("Density Trim  [0.0=Watertight]:", self.m360_trim,     "(>0.0 trims low-density bubbles on the outer surface)"),
+        ]:
+            fr = ttk.Frame(self._frm_poisson); fr.pack(fill=tk.X, padx=12, pady=2)
+            ttk.Label(fr, text=lbl, width=32).pack(side=tk.LEFT)
+            ttk.Entry(fr, textvariable=var, width=10).pack(side=tk.LEFT, padx=5)
+            ttk.Label(fr, text=hint, foreground="#555").pack(side=tk.LEFT)
+        f_lin = ttk.Frame(self._frm_poisson); f_lin.pack(fill=tk.X, padx=12, pady=2)
+        ttk.Checkbutton(f_lin, text="Linear Fit Interpolation", variable=self.m360_linear_fit).pack(side=tk.LEFT)
+        ttk.Label(f_lin, text="(Use linear fitting instead of default cubic interpolation)", foreground="#555").pack(side=tk.LEFT)
+
+        # Ball-Pivot params frame
+        self._frm_ballpivot = ttk.Frame(lf_recon)
+        ttk.Label(self._frm_ballpivot,
+            text="    Ball-Pivoting rolls a virtual ball across the cloud and stitches triangles wherever it touches 3 points.\n"
+                 "    It works best on dense, clean clouds and may leave holes where the cloud is sparse.",
+            foreground="#555", justify=tk.LEFT).pack(anchor=tk.W, padx=12, pady=(2, 4))
+        f_bp = ttk.Frame(self._frm_ballpivot); f_bp.pack(fill=tk.X, padx=12, pady=2)
+        ttk.Label(f_bp, text="Ball Radii (comma-separated mm)  [e.g. 1, 2, 4]:", width=40).pack(side=tk.LEFT)
+        ttk.Entry(f_bp, textvariable=self.s_radii, width=20).pack(side=tk.LEFT, padx=5)
+        ttk.Label(f_bp, text="(Multiple radii fill gaps at different scales)", foreground="#555").pack(side=tk.LEFT)
+        ttk.Label(self._frm_ballpivot,
+            text="    ⚠ Ball-Pivoting requires Centroid orientation. Selecting it will auto-switch the orientation above.",
+            foreground="#886600", justify=tk.LEFT).pack(anchor=tk.W, padx=12, pady=(0, 4))
+
+        self._update_unified_recon_ui()   # set initial visibility
+
+        # ── 4. MeshLab Post-Processing ────────────────────────────────────────
+        lf_ml = ttk.LabelFrame(root, text="4. MeshLab Post-Processing  (optional — requires: pip install pymeshlab)")
+        lf_ml.pack(fill=tk.X, padx=10, pady=5)
+
+        f_ml_en = ttk.Frame(lf_ml); f_ml_en.pack(fill=tk.X, padx=8, pady=5)
+        ttk.Checkbutton(f_ml_en, text="Enable MeshLab post-processing",
+                        variable=self.s_use_meshlab).pack(side=tk.LEFT)
+        ttk.Label(f_ml_en,
+            text="  Applies smoothing, hole-filling, and simplification AFTER reconstruction.",
+            foreground="#555").pack(side=tk.LEFT)
+
+        # Smoothing
+        f_smt = ttk.Frame(lf_ml); f_smt.pack(fill=tk.X, padx=12, pady=2)
+        ttk.Label(f_smt, text="Smoothing Algorithm:", width=22).pack(side=tk.LEFT)
+        ttk.Radiobutton(f_smt, text="Taubin  (recommended — preserves shape)",
+                        variable=self.s_ml_smooth_type, value="taubin").pack(side=tk.LEFT, padx=5)
+        ttk.Radiobutton(f_smt, text="Laplacian  (stronger — may shrink model)",
+                        variable=self.s_ml_smooth_type, value="laplacian").pack(side=tk.LEFT, padx=5)
+        f_smi = ttk.Frame(lf_ml); f_smi.pack(fill=tk.X, padx=12, pady=2)
+        ttk.Label(f_smi, text="Smooth Iterations  [Default 10]:", width=32).pack(side=tk.LEFT)
+        ttk.Entry(f_smi, textvariable=self.s_ml_smooth_iters, width=8).pack(side=tk.LEFT, padx=5)
+        ttk.Label(f_smi, text="(Higher = smoother surface, more time)", foreground="#555").pack(side=tk.LEFT)
+
+        # Close holes
+        f_ch = ttk.Frame(lf_ml); f_ch.pack(fill=tk.X, padx=12, pady=2)
+        ttk.Checkbutton(f_ch, text="Close Holes", variable=self.s_ml_close_holes).pack(side=tk.LEFT)
+        ttk.Label(f_ch, text="   Max Hole Size (edges):", width=24).pack(side=tk.LEFT)
+        ttk.Entry(f_ch, textvariable=self.s_ml_close_max_size, width=8).pack(side=tk.LEFT, padx=5)
+        ttk.Label(f_ch, text="(Fills openings smaller than this edge count. Default: 30)",
+                  foreground="#555").pack(side=tk.LEFT)
+
+        # Simplify
+        f_simp = ttk.Frame(lf_ml); f_simp.pack(fill=tk.X, padx=12, pady=2)
+        ttk.Checkbutton(f_simp, text="Simplify Mesh (Quadric Edge Collapse)",
+                        variable=self.s_ml_simplify).pack(side=tk.LEFT)
+        ttk.Label(f_simp, text="   Target Faces:", width=16).pack(side=tk.LEFT)
+        ttk.Entry(f_simp, textvariable=self.s_ml_target_faces, width=10).pack(side=tk.LEFT, padx=5)
+        ttk.Label(f_simp, text="(Default: 50 000 — reduce if STL is too large for slicer)",
+                  foreground="#555").pack(side=tk.LEFT)
+
+        # ── 5. Save Normals PLY ───────────────────────────────────────────────
+        lf_sn = ttk.LabelFrame(root, text="5. Save Normals Point Cloud  (optional debug output)")
+        lf_sn.pack(fill=tk.X, padx=10, pady=5)
+
+        f_sncb = ttk.Frame(lf_sn); f_sncb.pack(fill=tk.X, padx=8, pady=4)
+        ttk.Checkbutton(f_sncb,
+            text="Save point cloud with embedded normals BEFORE meshing step  (as .PLY)",
+            variable=self.m360_save_normals).pack(side=tk.LEFT)
+        f_snp = ttk.Frame(lf_sn); f_snp.pack(fill=tk.X, padx=8, pady=4)
+        ttk.Button(f_snp, text="Select Output .PLY",
+                   command=lambda: self.sel_file_save(self.m360_normals_out, "PLY")).pack(side=tk.LEFT)
+        ttk.Entry(f_snp, textvariable=self.m360_normals_out).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        ttk.Label(lf_sn,
+            text="Open the saved .PLY in CloudCompare or MeshLab to verify normals are pointing outward correctly.",
+            foreground="#555", justify=tk.LEFT, wraplength=650).pack(padx=8, pady=(0, 5))
+
+        # ── Run Button ────────────────────────────────────────────────────────
+        ttk.Button(root, text="▶  Run Meshing & Reconstruction",
+                   command=self.do_unified_meshing).pack(fill=tk.X, padx=20, pady=20)
 
     def setup_turntable_tab(self):
         # Tab 5 Automatic Arduino motor control (Turntable)
@@ -1037,192 +1144,152 @@ class ScannerGUI:
         ttk.Label(root, textvariable=self.tt_status, font=("Arial", 12)).pack(pady=10)
         ttk.Button(root, text="START AUTO SCAN", command=self.do_auto_scan_sequence, state="normal").pack(fill=tk.X, padx=20, pady=10)
 
-    def setup_stl_tab(self):
-        # Tab 7 (Final): STL Reconstruction — wrapped in a scrollable canvas
-        # because the extra Normal + MeshLab sections make it too tall for a fixed window
-        main_frame = self.tab_recon
+    # ── Unified Meshing tab: UI update helpers ─────────────────────────────
 
-        canvas = tk.Canvas(main_frame, highlightthickness=0)
-        scrollbar = ttk.Scrollbar(main_frame, orient="vertical", command=canvas.yview)
-        root = ttk.Frame(canvas)
-        root.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        frame_id = canvas.create_window((0, 0), window=root, anchor="nw")
-        canvas.bind("<Configure>", lambda e: canvas.itemconfig(frame_id, width=e.width))
-        canvas.configure(yscrollcommand=scrollbar.set)
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
+    def _update_unified_norm_ui(self):
+        """Show/hide the normal-estimation or centroid param frames based on selection."""
+        mode = self.unified_normal_mode.get()
+        if mode in ("radial", "tangent"):
+            self._frm_centroid.pack_forget()
+            self._frm_norm_est.pack(fill=tk.X, padx=5, pady=2)
+        else:  # centroid
+            self._frm_norm_est.pack_forget()
+            self._frm_centroid.pack(fill=tk.X, padx=5, pady=2)
 
-        def _on_mousewheel(event):
-            try:
-                if self.notebook.select() == str(self.tab_recon):
-                    canvas.yview_scroll(int(-1*(event.delta/120)), "units")
-            except Exception:
-                pass
-        canvas.bind_all("<MouseWheel>", _on_mousewheel, add="+")
+    def _update_unified_recon_ui(self):
+        """Show/hide the Poisson or Ball-Pivot param frames; auto-enforce Centroid for ball_pivot."""
+        method = self.unified_recon_method.get()
+        if method == "poisson":
+            self._frm_ballpivot.pack_forget()
+            self._frm_poisson.pack(fill=tk.X, padx=5, pady=2)
+        else:  # ball_pivot — requires centroid orientation
+            self._frm_poisson.pack_forget()
+            self._frm_ballpivot.pack(fill=tk.X, padx=5, pady=2)
+            if self.unified_normal_mode.get() != "centroid":
+                self.unified_normal_mode.set("centroid")
+                self._update_unified_norm_ui()
 
-        ttk.Label(root, text="STL Reconstruction", font=("Arial", 14, "bold")).pack(pady=10)
+    # ── Unified Meshing tab: run function ──────────────────────────────────
 
-        # ── Files ──────────────────────────────────────────────────────────────
-        lf_files = ttk.LabelFrame(root, text="Files")
-        lf_files.pack(fill=tk.X, padx=10, pady=5)
+    def do_unified_meshing(self):
+        """Run meshing from the unified Tab 5. Routes to mesh_360 or reconstruct_stl
+        based on the selected normal orientation and reconstruction method."""
+        in_file  = self.m360_input_ply.get()
+        out_file = self.m360_output_stl.get()
+        normal_mode  = self.unified_normal_mode.get()    # radial | tangent | centroid
+        recon_method = self.unified_recon_method.get()   # poisson | ball_pivot
 
-        f_in = ttk.Frame(lf_files); f_in.pack(fill=tk.X, padx=5, pady=5)
-        ttk.Button(f_in, text="Select Input .PLY",
-                   command=lambda: self.sel_file_load(self.s_input_ply, "PLY")).pack(side=tk.LEFT)
-        ttk.Entry(f_in, textvariable=self.s_input_ply).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        # Validate files
+        if not os.path.isfile(in_file):
+            messagebox.showerror("Error", "Input .PLY not found.")
+            return
+        if not out_file:
+            messagebox.showerror("Error", "Please select an output .STL file.")
+            return
 
-        f_out = ttk.Frame(lf_files); f_out.pack(fill=tk.X, padx=5, pady=5)
-        ttk.Button(f_out, text="Select Output .STL",
-                   command=lambda: self.sel_file_save(self.s_output_stl, "STL")).pack(side=tk.LEFT)
-        ttk.Entry(f_out, textvariable=self.s_output_stl).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        # Save-normals path
+        save_normals_path = None
+        if self.m360_save_normals.get():
+            save_normals_path = self.m360_normals_out.get()
+            if not save_normals_path:
+                messagebox.showerror("Error", "Please select an output path for the normals .PLY.")
+                return
 
-        # ── Reconstruction Method ────────────────────────────────────────────────
-        lf_mode = ttk.LabelFrame(root, text="Reconstruction Method & Parameters")
-        lf_mode.pack(fill=tk.X, padx=10, pady=5)
+        popup = self._make_progress_popup("Meshing & Reconstruction…")
+        log   = popup["log_cb"]
+        stop  = popup["stop_event"]
 
-        f_m = ttk.Frame(lf_mode); f_m.pack(fill=tk.X, padx=5, pady=5)
-        ttk.Label(f_m, text="Mode:").pack(side=tk.LEFT)
-        cb = ttk.Combobox(f_m, textvariable=self.s_mode, values=["watertight", "surface"], state="readonly")
-        cb.pack(side=tk.LEFT, padx=5)
-        cb.bind("<<ComboboxSelected>>", self.update_stl_params)
+        log(f"Input:  {in_file}")
+        log(f"Output: {out_file}")
+        log(f"Normal mode: {normal_mode}   Recon: {recon_method}")
 
-        # Dynamic frame that swaps between Poisson depth or Ball Radii inputs
-        self.f_stl_params = ttk.Frame(lf_mode)
-        self.f_stl_params.pack(fill=tk.X, padx=5, pady=5)
-        self.update_stl_params()
+        # ── Path A: Radial/Tangent + Poisson → use mesh_360 (advanced Poisson path) ──
+        if normal_mode in ("radial", "tangent") and recon_method == "poisson":
+            depth     = self.m360_depth.get()
+            trim      = self.m360_trim.get()
+            p_width   = self.m360_width.get()
+            p_scale   = self.m360_scale.get()
+            p_linear  = self.m360_linear_fit.get()
+            p_threads = self.m360_threads.get()
+            n_rad     = self.m360_normal_radius.get()
+            n_max     = self.m360_normal_max_nn.get()
 
-        # ── Normal Orientation ──────────────────────────────────────────────────
-        lf_norm = ttk.LabelFrame(root, text="Normal Vector Orientation")
-        lf_norm.pack(fill=tk.X, padx=10, pady=5)
+            log(f"Depth={depth}  Trim={trim}  Width={p_width}  Scale={p_scale}  Threads={p_threads}")
+            log(f"Normal radius={n_rad}  max_nn={n_max}")
 
-        f_cn = ttk.Frame(lf_norm); f_cn.pack(fill=tk.X, padx=5, pady=5)
-        ttk.Checkbutton(
-            f_cn,
-            text="Use Centroid-Based Outward Orientation (Recommended)",
-            variable=self.s_centroid_orient
-        ).pack(side=tk.LEFT)
+            def run_a():
+                try:
+                    log("Estimating normals and running Poisson reconstruction…")
+                    self.processor.mesh_360(
+                        input_path=in_file, output_path=out_file,
+                        depth=depth, density_trim=trim, orientation_mode=normal_mode,
+                        width=p_width, scale=p_scale, linear_fit=p_linear, n_threads=p_threads,
+                        normal_radius=n_rad, normal_max_nn=n_max,
+                        save_normals_path=save_normals_path
+                    )
+                    if stop.is_set():
+                        self._close_progress_popup(popup); return
+                    log("Meshing complete!")
+                    self._close_progress_popup(popup, success=True,
+                        message=f"Mesh saved to:\n{out_file}")
+                except Exception as e:
+                    log(f"ERROR: {e}")
+                    self._close_progress_popup(popup, success=False, message=str(e))
 
-        norm_desc = (
-            "What it does: Calculates the geometric center of ALL points in the cloud,\n"
-            "then forces every normal vector to point AWAY from that center.\n"
-            "This prevents inside-out surfaces where normals face the wrong direction.\n"
-            "\u2714 Best for: closed objects scanned from all sides (360\u00b0 scans).\n"
-            "When OFF: uses Open3D's graph-consistency method (may fail on complex shapes)."
-        )
-        ttk.Label(lf_norm, text=norm_desc, foreground="#555", justify=tk.LEFT, wraplength=620).pack(padx=5, pady=(0,3))
+            threading.Thread(target=run_a, daemon=True).start()
 
-        # Consistency pass row (runs AFTER centroid orient to fix any remaining stray normals)
-        f_cp = ttk.Frame(lf_norm); f_cp.pack(fill=tk.X, padx=5, pady=3)
-        ttk.Checkbutton(
-            f_cp,
-            text="Consistency Pass after centroid orient  (propagates outward direction via neighborhood graph)",
-            variable=self.s_consistency_pass
-        ).pack(side=tk.LEFT)
+        # ── Path B: Centroid orient or Ball-Pivoting → use reconstruct_stl ──────────
+        else:
+            mode_str = "watertight" if recon_method == "poisson" else "surface"
+            params = {}
+            if mode_str == "watertight":
+                params["depth"] = self.m360_depth.get()
+            else:
+                params["radii"] = self.s_radii.get()
 
-        f_cp_k = ttk.Frame(lf_norm); f_cp_k.pack(fill=tk.X, padx=5, pady=2)
-        ttk.Label(f_cp_k, text="    Neighbors (k)  [Default 30]:").pack(side=tk.LEFT)
-        ttk.Entry(f_cp_k, textvariable=self.s_consistency_k, width=8).pack(side=tk.LEFT, padx=5)
-        ttk.Label(f_cp_k, text="(Higher k = more influence per point, slower. 20-50 is typical)",
-                  foreground="#555").pack(side=tk.LEFT)
+            use_centroid    = (normal_mode == "centroid")
+            use_consistency = self.s_consistency_pass.get() if use_centroid else False
+            consistency_k   = self.s_consistency_k.get()
 
-        cp_desc = (
-            "    How it works: After centroid orient makes all normals face outward, this step runs\n"
-            "    orient_normals_consistent_tangent_plane(k) to check every normal against its k\n"
-            "    nearest neighbors. Any 'stray' normals still pointing inward get flipped to match\n"
-            "    the majority direction of their neighborhood.\n"
-            "    \u26a0 On very noisy clouds this may re-flip some correct normals \u2014 use with care."
-        )
-        ttk.Label(lf_norm, text=cp_desc, foreground="#555", justify=tk.LEFT, wraplength=620).pack(padx=5, pady=(0, 5))
+            meshlab_params = None
+            if self.s_use_meshlab.get():
+                meshlab_params = {
+                    "enabled":        True,
+                    "smooth_type":    self.s_ml_smooth_type.get(),
+                    "smooth_iters":   self.s_ml_smooth_iters.get(),
+                    "close_holes":    self.s_ml_close_holes.get(),
+                    "close_max_size": self.s_ml_close_max_size.get(),
+                    "simplify":       self.s_ml_simplify.get(),
+                    "target_faces":   self.s_ml_target_faces.get(),
+                }
+
+            log(f"Mode: {mode_str}  Centroid orient: {use_centroid}  Consistency: {use_consistency}")
+            if meshlab_params:
+                log("MeshLab post-processing: enabled")
+
+            def run_b():
+                try:
+                    log("Running reconstruction…")
+                    self.processor.reconstruct_stl(
+                        in_file, out_file, mode_str, params,
+                        centroid_orient=use_centroid,
+                        consistency_pass=use_consistency,
+                        consistency_k=consistency_k,
+                        meshlab_params=meshlab_params,
+                        save_normals_path=save_normals_path
+                    )
+                    if stop.is_set():
+                        self._close_progress_popup(popup); return
+                    log(f"STL saved → {out_file}")
+                    self._close_progress_popup(popup, success=True,
+                        message=f"STL saved to:\n{out_file}")
+                except Exception as e:
+                    log(f"ERROR: {e}")
+                    self._close_progress_popup(popup, success=False, message=str(e))
+
+            threading.Thread(target=run_b, daemon=True).start()
 
 
-        # ── MeshLab Post-Processing ──────────────────────────────────────────────
-        lf_ml = ttk.LabelFrame(root, text="MeshLab Post-Processing (pymeshlab)")
-        lf_ml.pack(fill=tk.X, padx=10, pady=5)
-
-        f_ml_en = ttk.Frame(lf_ml); f_ml_en.pack(fill=tk.X, padx=5, pady=5)
-        ttk.Checkbutton(
-            f_ml_en,
-            text="Enable MeshLab post-processing  (requires: pip install pymeshlab)",
-            variable=self.s_use_meshlab
-        ).pack(side=tk.LEFT)
-
-        ml_intro = (
-            "Applies MeshLab algorithms to the mesh AFTER Open3D reconstruction.\n"
-            "Useful for smoothing rough STLs and filling small gaps or holes."
-        )
-        ttk.Label(lf_ml, text=ml_intro, foreground="#333", justify=tk.LEFT, wraplength=620).pack(padx=5, pady=(0,3))
-
-        # Smoothing type
-        f_sm_type = ttk.Frame(lf_ml); f_sm_type.pack(fill=tk.X, padx=5, pady=3)
-        ttk.Label(f_sm_type, text="Smoothing Algorithm:", width=22).pack(side=tk.LEFT)
-        ttk.Radiobutton(f_sm_type, text="Taubin (recommended — preserves shape)",
-                        variable=self.s_ml_smooth_type, value="taubin").pack(side=tk.LEFT, padx=5)
-        ttk.Radiobutton(f_sm_type, text="Laplacian (stronger — may shrink model)",
-                        variable=self.s_ml_smooth_type, value="laplacian").pack(side=tk.LEFT, padx=5)
-
-        f_sm_desc = ttk.Frame(lf_ml); f_sm_desc.pack(fill=tk.X, padx=5)
-        sm_desc_text = (
-            "  Taubin: Alternates shrink/expand steps — smooths noise without collapsing volume. Best default.\n"
-            "  Laplacian: Moves each vertex to the average of its neighbours. Stronger effect, may cause shrinkage."
-        )
-        ttk.Label(f_sm_desc, text=sm_desc_text, foreground="#555", justify=tk.LEFT, wraplength=620).pack(anchor=tk.W)
-
-        # Smoothing iterations
-        f_sm_it = ttk.Frame(lf_ml); f_sm_it.pack(fill=tk.X, padx=5, pady=3)
-        ttk.Label(f_sm_it, text="Smooth Iterations  [Default 10]:", width=30).pack(side=tk.LEFT)
-        ttk.Entry(f_sm_it, textvariable=self.s_ml_smooth_iters, width=8).pack(side=tk.LEFT, padx=5)
-        ttk.Label(f_sm_it, text="(Higher = smoother surface, more processing time)",
-                  foreground="#555").pack(side=tk.LEFT)
-
-        # Close Holes
-        f_ch = ttk.Frame(lf_ml); f_ch.pack(fill=tk.X, padx=5, pady=3)
-        ttk.Checkbutton(f_ch, text="Close Holes", variable=self.s_ml_close_holes).pack(side=tk.LEFT)
-        ttk.Label(f_ch, text="Max Hole Size (edges):", width=22).pack(side=tk.LEFT, padx=(10,0))
-        ttk.Entry(f_ch, textvariable=self.s_ml_close_max_size, width=8).pack(side=tk.LEFT, padx=5)
-
-        f_ch_desc = ttk.Frame(lf_ml); f_ch_desc.pack(fill=tk.X, padx=5)
-        ttk.Label(f_ch_desc,
-                  text="  Fills gaps/openings in the mesh smaller than 'Max Hole Size' edges.\n"
-                       "  Useful when Poisson reconstruction leaves small open patches. Default: 30.",
-                  foreground="#555", justify=tk.LEFT, wraplength=620).pack(anchor=tk.W)
-
-        # Simplify (Quadric Edge Collapse)
-        f_simp = ttk.Frame(lf_ml); f_simp.pack(fill=tk.X, padx=5, pady=3)
-        ttk.Checkbutton(f_simp, text="Simplify Mesh (Quadric Edge Collapse)",
-                        variable=self.s_ml_simplify).pack(side=tk.LEFT)
-        ttk.Label(f_simp, text="Target Faces:", width=14).pack(side=tk.LEFT, padx=(10,0))
-        ttk.Entry(f_simp, textvariable=self.s_ml_target_faces, width=10).pack(side=tk.LEFT, padx=5)
-
-        f_simp_desc = ttk.Frame(lf_ml); f_simp_desc.pack(fill=tk.X, padx=5)
-        ttk.Label(f_simp_desc,
-                  text="  Reduces number of triangles to 'Target Faces' while preserving shape as much as possible.\n"
-                       "  Recommended if STL file size is too large for 3D printing slicer. Default: 50,000 faces.",
-                  foreground="#555", justify=tk.LEFT, wraplength=620).pack(anchor=tk.W)
-
-        # ── Save Normals PLY (same option as 360 Meshing tab) ───────────────────────
-        lf_sn = ttk.LabelFrame(root, text="Save Normals Point Cloud")
-        lf_sn.pack(fill=tk.X, padx=10, pady=5)
-
-        f_sn_cb = ttk.Frame(lf_sn); f_sn_cb.pack(fill=tk.X, padx=5, pady=4)
-        ttk.Checkbutton(
-            f_sn_cb,
-            text="Save point cloud with normals after orientation step (as .PLY)",
-            variable=self.s_save_normals
-        ).pack(side=tk.LEFT)
-
-        f_sn_path = ttk.Frame(lf_sn); f_sn_path.pack(fill=tk.X, padx=5, pady=4)
-        ttk.Button(
-            f_sn_path, text="Select Output .PLY",
-            command=lambda: self.sel_file_save(self.s_normals_out, "PLY")
-        ).pack(side=tk.LEFT)
-        ttk.Entry(f_sn_path, textvariable=self.s_normals_out).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
-
-        ttk.Label(lf_sn,
-                  text="Saves the point cloud (with normal vectors embedded) BEFORE meshing begins.\n"
-                       "Open in CloudCompare or MeshLab to verify normals are facing outward correctly.",
-                  foreground="#555", justify=tk.LEFT, wraplength=620).pack(padx=5, pady=(0, 5))
-
-        ttk.Button(root, text="Run STL Reconstruction", command=self.do_stl_recon).pack(fill=tk.X, padx=20, pady=20)
 
 
     def setup_calib_check_tab(self):
