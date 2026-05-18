@@ -717,7 +717,7 @@ class ProcessingLogic:
         print(f"[Merge 360] Saved merged cloud to {output_path}")
 
     @staticmethod
-    def reconstruct_stl(input_path, output_path, mode="watertight", params=None, centroid_orient=True, consistency_pass=False, consistency_k=30, meshlab_params=None, save_normals_path=None):
+    def reconstruct_stl(input_path, output_path, mode="watertight", params=None, centroid_orient=True, consistency_pass=False, consistency_k=30, meshlab_params=None, save_normals_path=None, custom_center=None):
         # Function used to create a 3D wireframe or solid mesh (STL from Point Cloud), suitable for 3D printing tasks
         # centroid_orient:   When True, calculates the geometric center of all points and forces every
         #                    normal to point OUTWARD from that center. More reliable than graph-consistency.
@@ -743,19 +743,31 @@ class ProcessingLogic:
             pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=10, max_nn=30))
 
         if centroid_orient:
-            # CENTROID METHOD: 
-            # 1. Compute the geometric center (mean of all point positions)
-            # 2. Use Open3D's orient_normals_towards_camera_location() with the centroid as
-            #    the "camera" — this makes ALL normals point TOWARD the centroid (inward)
-            # 3. Multiply all normals by -1 to flip them OUTWARD from the centroid
-            # This is highly reliable for closed objects (e.g., 360-degree scans)
-            center = np.asarray(pcd.points).mean(axis=0)  # Centroid = average of all XYZ coordinates
-            print(f"[Recon] Centroid normal orient: center = [{center[0]:.3f}, {center[1]:.3f}, {center[2]:.3f}]")
-            pcd.orient_normals_towards_camera_location(center)   # Orient inward toward centroid
-            pcd.normals = o3d.utility.Vector3dVector(            # Flip to outward
-                np.asarray(pcd.normals) * -1.0
-            )
-            print("[Recon] Centroid-based outward orientation applied.")
+            # CENTROID METHOD:
+            # If the user manually adjusted the centroid in the Inspector popup, use that.
+            # Otherwise fall back to the AABB midpoint (unaffected by point density).
+            if custom_center is not None:
+                center = np.asarray(custom_center, dtype=float)
+                print(f"[Recon] Centroid normal orient: center (USER-SET) = [{center[0]:.3f}, {center[1]:.3f}, {center[2]:.3f}]")
+            else:
+                center = (np.asarray(pcd.get_max_bound()) + np.asarray(pcd.get_min_bound())) / 2.0
+                print(f"[Recon] Centroid normal orient: center (AABB mid) = [{center[0]:.3f}, {center[1]:.3f}, {center[2]:.3f}]")
+            # Per-point guaranteed outward flip:
+            # For each point, compute the vector FROM the centroid TO that point.
+            # If a normal has a negative dot product with that vector, it is pointing
+            # INWARD toward the centroid and needs to be flipped.
+            # This is a direct per-point check — it is 100% guaranteed to make every
+            # normal point outward from the centroid, regardless of the object shape.
+            pts   = np.asarray(pcd.points)
+            norms = np.asarray(pcd.normals).copy()
+            to_point = pts - center                          # vector from centroid to each point
+            dots = np.einsum('ij,ij->i', norms, to_point)   # dot product per point
+            inward_mask = dots < 0                           # True = normal pointing inward
+            norms[inward_mask] *= -1.0                       # flip only the inward ones
+            pcd.normals = o3d.utility.Vector3dVector(norms)
+            flipped = int(inward_mask.sum())
+            print(f"[Recon] Centroid-based outward orientation applied. "
+                  f"Flipped {flipped}/{len(norms)} normals ({flipped/max(len(norms),1)*100:.1f}%) outward.")
         else:
             # GRAPH METHOD: check and rotate all Normal lines to point in the same direction
             # using a minimum spanning tree on the normal directions (may fail on complex shapes)

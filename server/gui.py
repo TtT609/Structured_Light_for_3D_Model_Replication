@@ -1283,11 +1283,285 @@ class ScannerGUI:
                     log(f"STL saved → {out_file}")
                     self._close_progress_popup(popup, success=True,
                         message=f"STL saved to:\n{out_file}")
+                    # If centroid mode + save-normals: open the Centroid Inspector popup
+                    if use_centroid and save_normals_path:
+                        self.root.after(200, lambda: self._show_centroid_inspector(
+                            in_file=in_file,
+                            out_file=out_file,
+                            mode_str=mode_str,
+                            params=params,
+                            use_consistency=use_consistency,
+                            consistency_k=consistency_k,
+                            meshlab_params=meshlab_params,
+                            save_normals_path=save_normals_path,
+                        ))
                 except Exception as e:
                     log(f"ERROR: {e}")
                     self._close_progress_popup(popup, success=False, message=str(e))
 
             threading.Thread(target=run_b, daemon=True).start()
+
+
+    # ── Centroid Inspector popup ────────────────────────────────────────────
+
+    def _show_centroid_inspector(self, in_file, out_file, mode_str, params,
+                                  use_consistency, consistency_k,
+                                  meshlab_params, save_normals_path):
+        """Interactive popup: shows the input point cloud (white) + centroid (red).
+        The user can drag X/Y/Z sliders to reposition the centroid and then
+        click Recalculate & Reconstruct to re-run the whole pipeline with the
+        custom centroid position."""
+        import numpy as np
+        import open3d as o3d
+        import threading
+        import tkinter as tk
+        from tkinter import ttk
+
+        # ── 1. Load point cloud & compute default AABB centroid ──────────────
+        try:
+            pcd = o3d.io.read_point_cloud(in_file)
+            pts = np.asarray(pcd.points)
+        except Exception as e:
+            import tkinter.messagebox as mb
+            mb.showerror("Centroid Inspector", f"Could not load point cloud:\n{e}")
+            return
+
+        if len(pts) == 0:
+            return
+
+        mn = pts.min(axis=0)
+        mx = pts.max(axis=0)
+        auto_center = (mn + mx) / 2.0
+
+        # Down-sample for display speed (keep ≤ 8 000 pts in the scatter)
+        MAX_DISPLAY = 8000
+        if len(pts) > MAX_DISPLAY:
+            step = max(1, len(pts) // MAX_DISPLAY)
+            disp_pts = pts[::step]
+        else:
+            disp_pts = pts
+
+        # ── 2. Build Toplevel window ─────────────────────────────────────────
+        win = tk.Toplevel(self.root)
+        win.title("Centroid Inspector  —  adjust before final reconstruction")
+        win.geometry("1100x620")
+        win.resizable(True, True)
+        win.grab_set()   # modal-like (blocks interaction with main window)
+
+        # Title bar
+        hdr = tk.Frame(win, bg="#1a1a2e", pady=8)
+        hdr.pack(fill=tk.X)
+        tk.Label(hdr,
+                 text="🔴  Centroid Inspector",
+                 font=("Arial", 14, "bold"),
+                 fg="white", bg="#1a1a2e").pack(side=tk.LEFT, padx=16)
+        tk.Label(hdr,
+                 text="White = point cloud     Red sphere = centroid used for normal orientation",
+                 font=("Arial", 9), fg="#aaa", bg="#1a1a2e").pack(side=tk.LEFT, padx=8)
+
+        # Main horizontal split
+        body = tk.Frame(win, bg="#f4f4f4")
+        body.pack(fill=tk.BOTH, expand=True, padx=0, pady=0)
+
+        # ── 3. Left: matplotlib 3-D scatter ──────────────────────────────────
+        import matplotlib
+        matplotlib.use("TkAgg")
+        import matplotlib.pyplot as plt
+        from mpl_toolkits.mplot3d import Axes3D          # noqa: F401
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+        left_frame = tk.Frame(body, bg="#1e1e1e", relief="flat")
+        left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        fig = plt.Figure(figsize=(6.5, 5.5), facecolor="#1e1e1e")
+        ax  = fig.add_subplot(111, projection="3d", facecolor="#1e1e1e")
+        ax.tick_params(colors="#888", labelsize=7)
+        ax.xaxis.pane.fill = False
+        ax.yaxis.pane.fill = False
+        ax.zaxis.pane.fill = False
+        ax.set_xlabel("X", color="#aaa", fontsize=8)
+        ax.set_ylabel("Y", color="#aaa", fontsize=8)
+        ax.set_zlabel("Z", color="#aaa", fontsize=8)
+
+        # Draw cloud
+        ax.scatter(disp_pts[:, 0], disp_pts[:, 1], disp_pts[:, 2],
+                   s=0.8, c="white", alpha=0.45, linewidths=0, label="Point cloud")
+
+        # Draw centroid (will be updated by sliders)
+        centroid_scatter = ax.scatter(
+            [auto_center[0]], [auto_center[1]], [auto_center[2]],
+            s=180, c="red", marker="o", zorder=10, label="Centroid")
+
+        # Draw crosshair lines through centroid
+        pad = (mx - mn) * 0.05
+        line_x, = ax.plot([mn[0]-pad[0], mx[0]+pad[0]],
+                          [auto_center[1], auto_center[1]],
+                          [auto_center[2], auto_center[2]],
+                          color="red", linewidth=0.8, alpha=0.6)
+        line_y, = ax.plot([auto_center[0], auto_center[0]],
+                          [mn[1]-pad[1], mx[1]+pad[1]],
+                          [auto_center[2], auto_center[2]],
+                          color="red", linewidth=0.8, alpha=0.6)
+        line_z, = ax.plot([auto_center[0], auto_center[0]],
+                          [auto_center[1], auto_center[1]],
+                          [mn[2]-pad[2], mx[2]+pad[2]],
+                          color="red", linewidth=0.8, alpha=0.6)
+
+        ax.legend(loc="upper left", fontsize=7, facecolor="#333", labelcolor="white")
+        fig.tight_layout(pad=0.5)
+
+        canvas_widget = FigureCanvasTkAgg(fig, master=left_frame)
+        canvas_widget.draw()
+        canvas_widget.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        # ── 4. Right: controls panel ─────────────────────────────────────────
+        right_frame = tk.Frame(body, bg="#f0f0f0", width=320, relief="flat")
+        right_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=0)
+        right_frame.pack_propagate(False)
+
+        tk.Label(right_frame, text="Adjust Centroid Position",
+                 font=("Arial", 12, "bold"), bg="#f0f0f0", fg="#222").pack(pady=(16, 4))
+        tk.Label(right_frame,
+                 text="Move sliders to reposition the red centroid.\n"
+                      "Drag to rotate the 3-D view on the left.",
+                 font=("Arial", 8), bg="#f0f0f0", fg="#666",
+                 justify=tk.CENTER, wraplength=290).pack(pady=(0, 10))
+
+        ttk.Separator(right_frame, orient="horizontal").pack(fill=tk.X, padx=16, pady=4)
+
+        # Slider range: extend bounds by 20% on each side
+        slack = (mx - mn) * 0.20 + 1.0   # +1 so zero-extent axes still work
+        s_min = mn - slack
+        s_max = mx + slack
+
+        cx_var = tk.DoubleVar(value=float(auto_center[0]))
+        cy_var = tk.DoubleVar(value=float(auto_center[1]))
+        cz_var = tk.DoubleVar(value=float(auto_center[2]))
+
+        coord_label = tk.StringVar(value=(
+            f"Centroid:  X={auto_center[0]:.3f}  "
+            f"Y={auto_center[1]:.3f}  Z={auto_center[2]:.3f}"
+        ))
+
+        def _update_view(*_):
+            """Redraw the centroid marker and crosshairs whenever a slider moves."""
+            cx, cy, cz = cx_var.get(), cy_var.get(), cz_var.get()
+            # Update scatter (must use _offsets3d for mpl 3-D)
+            centroid_scatter._offsets3d = ([cx], [cy], [cz])
+            # Update crosshair lines
+            line_x.set_data([mn[0]-pad[0], mx[0]+pad[0]], [cy, cy])
+            line_x.set_3d_properties([cz, cz])
+            line_y.set_data([cx, cx], [mn[1]-pad[1], mx[1]+pad[1]])
+            line_y.set_3d_properties([cz, cz])
+            line_z.set_data([cx, cx], [cy, cy])
+            line_z.set_3d_properties([mn[2]-pad[2], mx[2]+pad[2]])
+            canvas_widget.draw_idle()
+            coord_label.set(
+                f"Centroid:  X={cx:.3f}  Y={cy:.3f}  Z={cz:.3f}"
+            )
+
+        cx_var.trace_add("write", _update_view)
+        cy_var.trace_add("write", _update_view)
+        cz_var.trace_add("write", _update_view)
+
+        def _make_axis_row(parent, label, var, lo, hi):
+            """Create one labelled slider+spinbox row."""
+            row = tk.Frame(parent, bg="#f0f0f0")
+            row.pack(fill=tk.X, padx=16, pady=6)
+            tk.Label(row, text=label, width=3, font=("Arial", 10, "bold"),
+                     bg="#f0f0f0", fg="#333").pack(side=tk.LEFT)
+            sl = ttk.Scale(row, from_=lo, to=hi, orient=tk.HORIZONTAL,
+                           variable=var, length=160)
+            sl.pack(side=tk.LEFT, padx=(4, 6))
+            sp = ttk.Spinbox(row, from_=lo, to=hi, increment=0.1,
+                             textvariable=var, width=9,
+                             format="%.3f")
+            sp.pack(side=tk.LEFT)
+
+        _make_axis_row(right_frame, " X", cx_var, float(s_min[0]), float(s_max[0]))
+        _make_axis_row(right_frame, " Y", cy_var, float(s_min[1]), float(s_max[1]))
+        _make_axis_row(right_frame, " Z", cz_var, float(s_min[2]), float(s_max[2]))
+
+        ttk.Separator(right_frame, orient="horizontal").pack(fill=tk.X, padx=16, pady=8)
+
+        # Coordinate readout
+        tk.Label(right_frame, textvariable=coord_label,
+                 font=("Consolas", 8), bg="#f0f0f0", fg="#0055aa",
+                 wraplength=290).pack(pady=2)
+
+        # Reset button
+        def _reset():
+            cx_var.set(float(auto_center[0]))
+            cy_var.set(float(auto_center[1]))
+            cz_var.set(float(auto_center[2]))
+
+        ttk.Button(right_frame, text="\u21ba  Reset to Auto (AABB center)",
+                   command=_reset).pack(fill=tk.X, padx=16, pady=(8, 2))
+
+        ttk.Separator(right_frame, orient="horizontal").pack(fill=tk.X, padx=16, pady=10)
+
+        tk.Label(right_frame,
+                 text="Click below to re-run normal\norientation + reconstruction\nwith the adjusted centroid:",
+                 font=("Arial", 9), bg="#f0f0f0", fg="#444",
+                 justify=tk.CENTER).pack(pady=(0, 6))
+
+        # ── Recalculate button ────────────────────────────────────────────────
+        def _recalculate():
+            custom = [cx_var.get(), cy_var.get(), cz_var.get()]
+            win.destroy()    # close inspector first
+
+            popup2 = self._make_progress_popup("Recalculating with custom centroid…")
+            log2   = popup2["log_cb"]
+            stop2  = popup2["stop_event"]
+
+            log2(f"Custom centroid: X={custom[0]:.3f}  Y={custom[1]:.3f}  Z={custom[2]:.3f}")
+            log2(f"Output: {out_file}")
+
+            def _run():
+                try:
+                    log2("Re-running reconstruction with custom centroid…")
+                    self.processor.reconstruct_stl(
+                        in_file, out_file, mode_str, params,
+                        centroid_orient=True,
+                        consistency_pass=use_consistency,
+                        consistency_k=consistency_k,
+                        meshlab_params=meshlab_params,
+                        save_normals_path=save_normals_path,
+                        custom_center=custom,
+                    )
+                    if stop2.is_set():
+                        self._close_progress_popup(popup2); return
+                    log2(f"STL saved \u2192 {out_file}")
+                    self._close_progress_popup(popup2, success=True,
+                        message=f"Reconstruction complete!\nSTL saved to:\n{out_file}")
+                except Exception as e:
+                    log2(f"ERROR: {e}")
+                    self._close_progress_popup(popup2, success=False, message=str(e))
+
+            threading.Thread(target=_run, daemon=True).start()
+
+        recon_btn = tk.Button(
+            right_frame,
+            text="\u25b6  Recalculate & Reconstruct",
+            font=("Arial", 11, "bold"),
+            bg="#0d6efd", fg="white",
+            activebackground="#0b5ed7", activeforeground="white",
+            relief="flat", pady=10, cursor="hand2",
+            command=_recalculate)
+        recon_btn.pack(fill=tk.X, padx=16, pady=(0, 4))
+
+        # Cancel button
+        cancel_btn = tk.Button(
+            right_frame,
+            text="\u2715  Cancel  (keep current STL)",
+            font=("Arial", 9),
+            bg="#e0e0e0", fg="#444",
+            activebackground="#ccc",
+            relief="flat", pady=6, cursor="hand2",
+            command=win.destroy)
+        cancel_btn.pack(fill=tk.X, padx=16, pady=(0, 16))
+
+
 
 
 
