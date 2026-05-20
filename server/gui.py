@@ -190,6 +190,24 @@ class ScannerGUI:
         self.mm_enable_icp = tk.BooleanVar(value=True)
         self.mm_match_mode = tk.StringVar(value="3")
 
+        # --- State Variables (Fix / Hole Filling) ---
+        self.fix_input_ply = tk.StringVar()
+        self.fix_output_ply = tk.StringVar()
+        self.fix_shape_mode = tk.StringVar(value="auto")       # auto|cylinder|sphere|plane
+        self.fix_density = tk.DoubleVar(value=1.0)             # fill density multiplier
+        self.fix_ransac_thresh = tk.DoubleVar(value=1.0)       # RANSAC inlier distance
+        self.fix_grid_res = tk.DoubleVar(value=1.0)            # parameter-space grid cell size
+        self.fix_debug_color = tk.BooleanVar(value=False)      # use debug color for fill points
+        # Manual cylinder parameters
+        self.fix_detection_mode = tk.StringVar(value="auto")   # 'auto' or 'manual'
+        self.fix_man_axis_x = tk.StringVar(value="0")
+        self.fix_man_axis_y = tk.StringVar(value="0")
+        self.fix_man_axis_z = tk.StringVar(value="1")
+        self.fix_man_cx = tk.StringVar(value="0")
+        self.fix_man_cy = tk.StringVar(value="0")
+        self.fix_man_cz = tk.StringVar(value="0")
+        self.fix_man_radius = tk.StringVar(value="0")
+
         # --- Camera Mode (Web Frontend vs Android Native) ---
         self.camera_mode = tk.StringVar(value="web")  # 'web' or 'android'
 
@@ -197,7 +215,7 @@ class ScannerGUI:
         self.notebook = ttk.Notebook(root) # Create horizontal tab menu
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         
-        # Create frames for each of the 9 tabs
+        # Create frames for each of the 10 tabs
         self.tab_scan = ttk.Frame(self.notebook)
         self.tab_multiPCP = ttk.Frame(self.notebook)
         self.tab_proc = ttk.Frame(self.notebook)
@@ -207,6 +225,7 @@ class ScannerGUI:
         self.tab_calib_check = ttk.Frame(self.notebook)
         self.tab_ply_inspect = ttk.Frame(self.notebook)
         self.tab_manual_merge = ttk.Frame(self.notebook)
+        self.tab_fix = ttk.Frame(self.notebook)
 
         # Add frames to the menu
         self.notebook.add(self.tab_scan,         text="1. Scan & Generate")
@@ -218,6 +237,7 @@ class ScannerGUI:
         self.notebook.add(self.tab_calib_check,  text="7. Calib Check")
         self.notebook.add(self.tab_ply_inspect,  text="8. PLY Inspector")
         self.notebook.add(self.tab_manual_merge, text="9. Manual Merge")
+        self.notebook.add(self.tab_fix,          text="10. Fix")
 
         # Initialize UI components for each tab
         self.setup_scan_tab()
@@ -229,6 +249,7 @@ class ScannerGUI:
         self.setup_calib_check_tab()
         self.setup_ply_inspect_tab()
         self.setup_manual_merge_tab()
+        self.setup_fix_tab()
 
     # ==========================================
     # GUI Layout Functions for Each Tab
@@ -1762,6 +1783,252 @@ class ScannerGUI:
         
         ttk.Button(root, text="▶ START MANUAL PLANE MERGE", command=self.do_manual_plane_merge).pack(fill=tk.X, padx=20, pady=20)
 
+    def setup_fix_tab(self):
+        """Tab 10: Fix — fill holes in point clouds by fitting geometric primitives."""
+        main_frame = self.tab_fix
+
+        canvas = tk.Canvas(main_frame, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(main_frame, orient="vertical", command=canvas.yview)
+        root = ttk.Frame(canvas)
+        root.bind("<Configure>",
+                  lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        fid = canvas.create_window((0, 0), window=root, anchor="nw")
+        canvas.bind("<Configure>", lambda e: canvas.itemconfig(fid, width=e.width))
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        def _mwheel(ev):
+            try:
+                if self.notebook.select() == str(self.tab_fix):
+                    canvas.yview_scroll(int(-1 * (ev.delta / 120)), "units")
+            except Exception:
+                pass
+        canvas.bind_all("<MouseWheel>", _mwheel, add="+")
+
+        ttk.Label(root, text="Fix — Point Cloud Hole Filler",
+                  font=("Arial", 14, "bold")).pack(pady=10)
+
+        explanation = (
+            "Fill holes/gaps in scanned point clouds by fitting geometric primitives\n"
+            "(Cylinder, Sphere, Plane) and generating synthetic points in the missing regions.\n"
+            "Best for objects with a known shape (e.g. cola cans, balls, boxes) where\n"
+            "parts of the surface are missing due to scanner occlusion."
+        )
+        ttk.Label(root, text=explanation, justify=tk.CENTER,
+                  foreground="#333", font=("Arial", 9, "italic")).pack(pady=(0, 8))
+
+        # ── 1. Files ──────────────────────────────────────────────────
+        lf_files = ttk.LabelFrame(root, text="1. Files")
+        lf_files.pack(fill=tk.X, padx=10, pady=5)
+
+        f_in = ttk.Frame(lf_files); f_in.pack(fill=tk.X, padx=5, pady=5)
+        ttk.Button(f_in, text="Select Input .PLY",
+                   command=lambda: self._fix_sel_input()).pack(side=tk.LEFT)
+        ttk.Entry(f_in, textvariable=self.fix_input_ply).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+
+        f_out = ttk.Frame(lf_files); f_out.pack(fill=tk.X, padx=5, pady=5)
+        ttk.Button(f_out, text="Select Output .PLY",
+                   command=lambda: self.sel_file_save(self.fix_output_ply, "PLY")).pack(side=tk.LEFT)
+        ttk.Entry(f_out, textvariable=self.fix_output_ply).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+
+        # ── 2. Shape Detection ────────────────────────────────────────
+        lf_shape = ttk.LabelFrame(root, text="2. Shape Detection Mode")
+        lf_shape.pack(fill=tk.X, padx=10, pady=5)
+
+        shape_desc = (
+            "Select which geometric shape to fit to your point cloud.\n"
+            "'Auto' tries all shapes and picks the one with the highest inlier ratio."
+        )
+        ttk.Label(lf_shape, text=shape_desc, foreground="#555",
+                  justify=tk.LEFT, wraplength=640).pack(padx=8, pady=(4, 2))
+
+        f_shape = ttk.Frame(lf_shape); f_shape.pack(fill=tk.X, padx=8, pady=6)
+        ttk.Radiobutton(f_shape, text="Auto  (try all, pick best)",
+                        variable=self.fix_shape_mode, value="auto").pack(side=tk.LEFT, padx=6)
+        ttk.Radiobutton(f_shape, text="Cylinder  (cans, tubes, pipes)",
+                        variable=self.fix_shape_mode, value="cylinder").pack(side=tk.LEFT, padx=6)
+        ttk.Radiobutton(f_shape, text="Sphere  (balls, domes)",
+                        variable=self.fix_shape_mode, value="sphere").pack(side=tk.LEFT, padx=6)
+        ttk.Radiobutton(f_shape, text="Plane  (flat surfaces)",
+                        variable=self.fix_shape_mode, value="plane").pack(side=tk.LEFT, padx=6)
+
+        # ── 2b. Detection Mode: RANSAC vs Manual ──────────────────────
+        lf_detect = ttk.LabelFrame(root, text="2b. Cylinder Detection Method")
+        lf_detect.pack(fill=tk.X, padx=10, pady=5)
+
+        f_dm = ttk.Frame(lf_detect); f_dm.pack(fill=tk.X, padx=8, pady=4)
+        ttk.Radiobutton(f_dm, text="Auto-detect (RANSAC)",
+                        variable=self.fix_detection_mode, value="auto",
+                        command=lambda: _toggle_manual()).pack(side=tk.LEFT, padx=6)
+        ttk.Radiobutton(f_dm, text="Manual Parameters  (use when RANSAC finds the wrong cylinder)",
+                        variable=self.fix_detection_mode, value="manual",
+                        command=lambda: _toggle_manual()).pack(side=tk.LEFT, padx=6)
+
+        # Manual parameter frame (shown only in manual mode)
+        lf_manual = ttk.LabelFrame(lf_detect, text="Manual Cylinder Parameters")
+
+        ttk.Label(lf_manual,
+                  text=("Enter the cylinder axis direction (any non-zero vector, will be normalised),\n"
+                        "a point on the axis (e.g. the centre of the can), and the radius.\n"
+                        "You can get these values from CloudCompare: select the can, use\n"
+                        "Edit > Fit > Cylinder, or read the bounding box centre."),
+                  foreground="#0055AA", justify=tk.LEFT, wraplength=620).pack(padx=6, pady=(4, 2))
+
+        # Axis direction row
+        f_ax = ttk.Frame(lf_manual); f_ax.pack(fill=tk.X, padx=6, pady=2)
+        ttk.Label(f_ax, text="Axis Direction  X:", width=18).pack(side=tk.LEFT)
+        ttk.Entry(f_ax, textvariable=self.fix_man_axis_x, width=10).pack(side=tk.LEFT, padx=2)
+        ttk.Label(f_ax, text="Y:").pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Entry(f_ax, textvariable=self.fix_man_axis_y, width=10).pack(side=tk.LEFT, padx=2)
+        ttk.Label(f_ax, text="Z:").pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Entry(f_ax, textvariable=self.fix_man_axis_z, width=10).pack(side=tk.LEFT, padx=2)
+        ttk.Label(f_ax, text="  (e.g. 0, 0, 1 for a vertical can)",
+                  foreground="#777").pack(side=tk.LEFT, padx=4)
+
+        # Center point row
+        f_ctr = ttk.Frame(lf_manual); f_ctr.pack(fill=tk.X, padx=6, pady=2)
+        ttk.Label(f_ctr, text="Center (on axis)  X:", width=18).pack(side=tk.LEFT)
+        ttk.Entry(f_ctr, textvariable=self.fix_man_cx, width=10).pack(side=tk.LEFT, padx=2)
+        ttk.Label(f_ctr, text="Y:").pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Entry(f_ctr, textvariable=self.fix_man_cy, width=10).pack(side=tk.LEFT, padx=2)
+        ttk.Label(f_ctr, text="Z:").pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Entry(f_ctr, textvariable=self.fix_man_cz, width=10).pack(side=tk.LEFT, padx=2)
+        ttk.Label(f_ctr, text="  (centre of the can, or any point on the axis)",
+                  foreground="#777").pack(side=tk.LEFT, padx=4)
+
+        # Radius row
+        f_rad = ttk.Frame(lf_manual); f_rad.pack(fill=tk.X, padx=6, pady=2)
+        ttk.Label(f_rad, text="Radius:", width=18).pack(side=tk.LEFT)
+        ttk.Entry(f_rad, textvariable=self.fix_man_radius, width=10).pack(side=tk.LEFT, padx=2)
+        ttk.Label(f_rad, text="  (same units as your point cloud — check PLY Inspector tab for bounding box)",
+                  foreground="#777").pack(side=tk.LEFT, padx=4)
+
+        # "Detect → Fill Fields" helper button
+        def _detect_fill_fields():
+            """Run RANSAC once and copy detected values into the manual fields."""
+            in_file = self.fix_input_ply.get().strip()
+            if not in_file or not os.path.isfile(in_file):
+                messagebox.showerror("Error", "Select a valid input .PLY file first.")
+                return
+            try:
+                import numpy as np
+                import open3d as o3d
+                from processing import ProcessingLogic
+                pcd = o3d.io.read_point_cloud(in_file)
+                pts = np.asarray(pcd.points)
+                if not pcd.has_normals():
+                    pcd.estimate_normals()
+                norms = np.asarray(pcd.normals)
+                thresh = self.fix_ransac_thresh.get()
+                result = ProcessingLogic._fit_cylinder_ransac(pts, thresh, normals=norms, iterations=3000)
+                if result is None:
+                    messagebox.showwarning("Detect", "Could not fit a cylinder. Try adjusting RANSAC threshold.")
+                    return
+                ctr, ax, rad, _ = result
+                self.fix_man_axis_x.set(f"{ax[0]:.6f}")
+                self.fix_man_axis_y.set(f"{ax[1]:.6f}")
+                self.fix_man_axis_z.set(f"{ax[2]:.6f}")
+                self.fix_man_cx.set(f"{ctr[0]:.4f}")
+                self.fix_man_cy.set(f"{ctr[1]:.4f}")
+                self.fix_man_cz.set(f"{ctr[2]:.4f}")
+                self.fix_man_radius.set(f"{rad:.4f}")
+                messagebox.showinfo("Detect",
+                    f"Detected cylinder:\n"
+                    f"  Axis: [{ax[0]:.4f}, {ax[1]:.4f}, {ax[2]:.4f}]\n"
+                    f"  Center: [{ctr[0]:.2f}, {ctr[1]:.2f}, {ctr[2]:.2f}]\n"
+                    f"  Radius: {rad:.4f}\n\n"
+                    "Values filled into the Manual Parameters fields.\nYou can now adjust them before running Fix.")
+            except Exception as ex:
+                messagebox.showerror("Detect Error", str(ex))
+
+        ttk.Button(lf_manual, text="🔍  Detect → Fill Fields  (run RANSAC once and copy result here)",
+                   command=_detect_fill_fields).pack(padx=6, pady=6)
+
+        def _toggle_manual():
+            if self.fix_detection_mode.get() == "manual":
+                lf_manual.pack(fill=tk.X, padx=8, pady=4)
+            else:
+                lf_manual.pack_forget()
+
+        # ── 3. Fill Parameters ────────────────────────────────────────
+        lf_params = ttk.LabelFrame(root, text="3. Fill Parameters")
+        lf_params.pack(fill=tk.X, padx=10, pady=5)
+
+        f_ransac = ttk.Frame(lf_params); f_ransac.pack(fill=tk.X, padx=5, pady=3)
+        ttk.Label(f_ransac, text="RANSAC Distance Threshold  [Default 1.0]:", width=38).pack(side=tk.LEFT)
+        ttk.Entry(f_ransac, textvariable=self.fix_ransac_thresh, width=10).pack(side=tk.LEFT, padx=5)
+        ttk.Label(f_ransac, text="(How close a point must be to the fitted shape to count as inlier)",
+                  foreground="#555").pack(side=tk.LEFT)
+
+        f_grid = ttk.Frame(lf_params); f_grid.pack(fill=tk.X, padx=5, pady=3)
+        ttk.Label(f_grid, text="Grid Resolution  [Default 1.0]:", width=38).pack(side=tk.LEFT)
+        ttk.Entry(f_grid, textvariable=self.fix_grid_res, width=10).pack(side=tk.LEFT, padx=5)
+        ttk.Label(f_grid, text="(Multiplier for cell size. Smaller = finer fill, more points. Larger = coarser)",
+                  foreground="#555").pack(side=tk.LEFT)
+
+        f_density = ttk.Frame(lf_params); f_density.pack(fill=tk.X, padx=5, pady=3)
+        ttk.Label(f_density, text="Fill Density Multiplier  [Default 1.0]:", width=38).pack(side=tk.LEFT)
+        ttk.Entry(f_density, textvariable=self.fix_density, width=10).pack(side=tk.LEFT, padx=5)
+        ttk.Label(f_density, text="(1.0 = match original density. 0.5 = sparse. 2.0 = extra dense)",
+                  foreground="#555").pack(side=tk.LEFT)
+
+        params_desc = (
+            "Tip: For a cola can, use Cylinder mode with RANSAC threshold ~1.0–2.0.\n"
+            "If the can has a lot of noise, increase the threshold. If fill points float\n"
+            "away from the surface, decrease it."
+        )
+        ttk.Label(lf_params, text=params_desc, foreground="#0066CC",
+                  font=("Arial", 8, "italic"), justify=tk.LEFT,
+                  wraplength=640).pack(padx=8, pady=(2, 6))
+
+        # ── 4. Color Options ──────────────────────────────────────────
+        lf_color = ttk.LabelFrame(root, text="4. Fill Point Color")
+        lf_color.pack(fill=tk.X, padx=10, pady=5)
+
+        f_color = ttk.Frame(lf_color); f_color.pack(fill=tk.X, padx=5, pady=5)
+        ttk.Checkbutton(
+            f_color,
+            text="Use debug color for fill points  (green — easy to see which points are generated)",
+            variable=self.fix_debug_color
+        ).pack(side=tk.LEFT)
+
+        color_desc = (
+            "When OFF: fill points inherit the average color from their nearest existing neighbors.\n"
+            "When ON: fill points are painted bright green so you can clearly distinguish real vs. generated."
+        )
+        ttk.Label(lf_color, text=color_desc, foreground="#555",
+                  justify=tk.LEFT, wraplength=640).pack(padx=8, pady=(0, 6))
+
+        # ── 5. Run ────────────────────────────────────────────────────
+        ttk.Button(root, text="▶  FIX HOLES",
+                   command=self.do_fix_holes).pack(fill=tk.X, padx=20, pady=12)
+
+        # ── 6. Log ────────────────────────────────────────────────────
+        lf_log = ttk.LabelFrame(root, text="Processing Log")
+        lf_log.pack(fill=tk.BOTH, expand=True, padx=10, pady=6)
+
+        self.txt_log_fix = tk.Text(lf_log, state="disabled", height=10,
+                                   wrap="word", font=("Consolas", 9))
+        sb_fix = ttk.Scrollbar(lf_log, orient="vertical",
+                                command=self.txt_log_fix.yview)
+        self.txt_log_fix.configure(yscrollcommand=sb_fix.set)
+        sb_fix.pack(side=tk.RIGHT, fill=tk.Y)
+        self.txt_log_fix.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+
+    def _fix_sel_input(self):
+        """Select input file for Fix tab and auto-fill the output path."""
+        f = filedialog.askopenfilename(filetypes=[("PLY", "*.ply")])
+        if f:
+            self.fix_input_ply.set(f)
+            # Auto-fill output: add _fixed suffix
+            if not self.fix_output_ply.get():
+                import os
+                base, ext = os.path.splitext(f)
+                self.fix_output_ply.set(base + "_fixed" + ext)
+
 
     # ── PLY Inspector helpers ─────────────────────────────────────────────────
 
@@ -3175,4 +3442,90 @@ class ScannerGUI:
                 log(traceback.format_exc())
                 self._close_progress_popup(popup, success=False, message=str(e))
                 
+        threading.Thread(target=run, daemon=True).start()
+
+    def do_fix_holes(self):
+        """Run Tab 10: Fix — fill holes in a point cloud."""
+        in_file = self.fix_input_ply.get().strip()
+        out_file = self.fix_output_ply.get().strip()
+
+        if not in_file or not out_file:
+            messagebox.showerror("Error", "Please select input and output files.")
+            return
+        if not os.path.isfile(in_file):
+            messagebox.showerror("Error", "Input .PLY file not found.")
+            return
+
+        shape_mode = self.fix_shape_mode.get()
+        fill_density = self.fix_density.get()
+        ransac_thresh = self.fix_ransac_thresh.get()
+        grid_res = self.fix_grid_res.get()
+        use_debug = self.fix_debug_color.get()
+
+        # Build manual_cylinder dict if in manual mode
+        manual_cylinder = None
+        if self.fix_detection_mode.get() == "manual":
+            try:
+                ax = [float(self.fix_man_axis_x.get()),
+                      float(self.fix_man_axis_y.get()),
+                      float(self.fix_man_axis_z.get())]
+                ctr = [float(self.fix_man_cx.get()),
+                       float(self.fix_man_cy.get()),
+                       float(self.fix_man_cz.get())]
+                rad = float(self.fix_man_radius.get())
+                if rad <= 0:
+                    messagebox.showerror("Error", "Manual radius must be > 0.")
+                    return
+                import numpy as _np
+                ax_arr = _np.array(ax)
+                if _np.linalg.norm(ax_arr) < 1e-9:
+                    messagebox.showerror("Error", "Axis direction cannot be a zero vector.")
+                    return
+                manual_cylinder = {"axis": ax, "center": ctr, "radius": rad}
+            except ValueError:
+                messagebox.showerror("Error",
+                    "Invalid manual parameters. All axis/center/radius fields must be numbers.")
+                return
+
+        popup = self._make_progress_popup("Fixing Holes (Point Cloud Repair)\u2026")
+        log = popup["log_cb"]
+        stop = popup["stop_event"]
+
+        log(f"Input:  {in_file}")
+        log(f"Output: {out_file}")
+        if manual_cylinder:
+            log(f"Mode: MANUAL CYLINDER")
+            log(f"  Axis:   {manual_cylinder['axis']}")
+            log(f"  Center: {manual_cylinder['center']}")
+            log(f"  Radius: {manual_cylinder['radius']}")
+        else:
+            log(f"Shape: {shape_mode}  Threshold: {ransac_thresh}")
+        log(f"Density: {fill_density}  Grid Res: {grid_res}  Debug Color: {use_debug}")
+
+        def run():
+            try:
+                self.processor.fill_holes(
+                    input_path=in_file,
+                    output_path=out_file,
+                    shape_mode=shape_mode,
+                    fill_density=fill_density,
+                    ransac_threshold=ransac_thresh,
+                    grid_resolution=grid_res,
+                    use_debug_color=use_debug,
+                    debug_color=(0.2, 0.9, 0.3),
+                    manual_cylinder=manual_cylinder,
+                    log_callback=log,
+                    stop_check=stop.is_set,
+                )
+                if stop.is_set():
+                    self._close_progress_popup(popup)
+                    return
+                self._close_progress_popup(popup, success=True,
+                    message=f"Hole filling complete!\nSaved to:\n{out_file}")
+            except Exception as e:
+                log(f"ERROR: {e}")
+                import traceback
+                log(traceback.format_exc())
+                self._close_progress_popup(popup, success=False, message=str(e))
+
         threading.Thread(target=run, daemon=True).start()

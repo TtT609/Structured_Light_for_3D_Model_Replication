@@ -1202,4 +1202,752 @@ class ProcessingLogic:
         log(f"Saving merged point cloud to {out_file}")
         o3d.io.write_point_cloud(out_file, pcd_combined)
 
+    # ==========================================
+    # HOLE FILLING (Fix Tab)
+    # ==========================================
+
+    @staticmethod
+    def _fit_cylinder_ransac(points, thresh, normals=None, iterations=3000):
+        """Fit a cylinder to points using normal-voting RANSAC.
+
+        For a cylinder, every surface normal is PERPENDICULAR to the axis.
+        So the axis direction is the one that is most consistently perpendicular
+        to the normals — found by voting in normal cross-product space.
+
+        If normals are not available, falls back to PCA-based estimation.
+
+        Returns (axis_point, axis_dir, radius, inlier_mask) or None.
+        axis_dir is a unit vector along the cylinder axis.
+        """
+        n = len(points)
+        best_count = 0
+        best_params = None
+        best_inliers = None
+
+        # ── Strategy 1: Normal-voting (preferred) ─────────────────────
+        # For a cylinder, normals are perpendicular to the axis.
+        # Cross product of any two normals gives a vector that is *parallel* to the axis.
+        # We RANSAC over pairs of normals to vote for the axis direction.
+        if normals is not None and len(normals) == n:
+            normals_unit = normals / (np.linalg.norm(normals, axis=1, keepdims=True) + 1e-12)
+            n_iterations = iterations
+
+            for _ in range(n_iterations):
+                # Pick 2 random surface normals
+                i1, i2 = np.random.choice(n, size=2, replace=False)
+                n1, n2 = normals_unit[i1], normals_unit[i2]
+
+                # Cross product gives a candidate axis direction
+                axis_cand = np.cross(n1, n2)
+                axis_len = np.linalg.norm(axis_cand)
+                if axis_len < 0.05:   # normals nearly parallel → poor estimate
+                    continue
+                axis_cand = axis_cand / axis_len
+
+                # Project all points perpendicular to this candidate axis
+                # and fit a circle in that 2D projected space
+                # Projected centre of the cloud
+                centroid = points.mean(axis=0)
+                vecs = points - centroid
+                t = np.dot(vecs, axis_cand)
+                radial_vecs = vecs - np.outer(t, axis_cand)
+                radial_dists = np.linalg.norm(radial_vecs, axis=1)
+
+                # Estimate the radius robustly
+                radius_cand = np.median(radial_dists)
+                if radius_cand < 1e-6:
+                    continue
+
+                errors = np.abs(radial_dists - radius_cand)
+                mask = errors < thresh
+                count = mask.sum()
+
+                if count > best_count:
+                    best_count = count
+                    best_inliers = mask
+                    best_params = (centroid, axis_cand, radius_cand)
+
+        # ── Strategy 2: Point-pair PCA fallback ───────────────────────
+        # Used when normals are unavailable or Strategy 1 gave poor results
+        if best_params is None or best_count < max(20, n * 0.03):
+            for _ in range(iterations):
+                idx = np.random.choice(n, size=8, replace=False)
+                sample = points[idx]
+
+                centroid_s = sample.mean(axis=0)
+                cov = np.cov((sample - centroid_s).T)
+                eigvals, eigvecs = np.linalg.eigh(cov)
+                axis_dir = eigvecs[:, np.argmax(eigvals)]
+                axis_dir = axis_dir / (np.linalg.norm(axis_dir) + 1e-12)
+
+                vecs = points - centroid_s
+                t_proj = np.dot(vecs, axis_dir)
+                radial_vecs = vecs - np.outer(t_proj, axis_dir)
+                radial_dists = np.linalg.norm(radial_vecs, axis=1)
+
+                radius = np.median(radial_dists[idx])
+                if radius < 1e-6:
+                    continue
+
+                errors = np.abs(radial_dists - radius)
+                inlier_mask = errors < thresh
+                count = inlier_mask.sum()
+
+                if count > best_count:
+                    best_count = count
+                    best_inliers = inlier_mask
+                    best_params = (centroid_s, axis_dir, radius)
+
+        if best_params is None:
+            return None
+
+        # ── Refinement pass ───────────────────────────────────────────
+        # Re-estimate axis using PCA on all inliers — much more data now,
+        # so PCA reliably finds the true elongation axis
+        inlier_pts = points[best_inliers]
+        centroid_r = inlier_pts.mean(axis=0)
+
+        # Weighted PCA: weight each inlier by how close to thresh=0 it is
+        # (closer to ideal cylinder surface = more weight)
+        vecs_r = inlier_pts - centroid_r
+        t_r = np.dot(vecs_r, best_params[1])
+        rad_r = np.linalg.norm(vecs_r - np.outer(t_r, best_params[1]), axis=1)
+        err_r = np.abs(rad_r - best_params[2])
+        weights = np.maximum(0, thresh - err_r)   # weight ∝ closeness to surface
+        if weights.sum() < 1e-9:
+            weights = np.ones(len(inlier_pts))
+
+        W = weights / weights.sum()
+        centroid_r = (inlier_pts * W[:, None]).sum(axis=0)
+
+        cov_r = np.cov((inlier_pts - centroid_r).T, aweights=weights + 1e-9)
+        eigvals_r, eigvecs_r = np.linalg.eigh(cov_r)
+
+        # For cylinder inliers, PCA gives 3 eigenvalues:
+        #   largest   → axis direction (most spread along the can height)
+        #   2nd+3rd   → radial spread (should be ~equal for a circle)
+        # *** Check the ratio: if the inliers really are cylinder-like the
+        #     largest eigval should dominate clearly over the other two.
+        axis_dir_r = eigvecs_r[:, np.argmax(eigvals_r)]
+        axis_dir_r = axis_dir_r / (np.linalg.norm(axis_dir_r) + 1e-12)
+
+        # If normals are available, use them to validate / flip the axis sign
+        # (axis direction is arbitrary ±; normals help pick a consistent orientation)
+        if normals is not None:
+            inlier_norms = normals[best_inliers]
+            # Average dot product of normals with the axis — should be ~0 for a cylinder
+            # If it's not, the axis might be pointing in the wrong direction; fix by
+            # picking the component of the axis most perpendicular to the bulk normals
+            pass   # sign doesn't matter for cylinder fill — both ± work identically
+
+        # Recompute radius from inliers using refined axis
+        vecs_all = inlier_pts - centroid_r
+        t_all2 = np.dot(vecs_all, axis_dir_r)
+        radial_all = np.linalg.norm(vecs_all - np.outer(t_all2, axis_dir_r), axis=1)
+        radius_r = np.median(radial_all)
+
+        # Final inlier mask on ALL points
+        vecs_full = points - centroid_r
+        t_full = np.dot(vecs_full, axis_dir_r)
+        rad_full = np.linalg.norm(vecs_full - np.outer(t_full, axis_dir_r), axis=1)
+        final_mask = np.abs(rad_full - radius_r) < thresh
+
+        return (centroid_r, axis_dir_r, radius_r, final_mask)
+
+    @staticmethod
+    def _fit_sphere_ransac(points, thresh, iterations=3000):
+        """Fit a sphere to points using RANSAC.
+
+        Returns (center, radius, inlier_mask) or None.
+        """
+        best_inliers = None
+        best_count = 0
+        best_params = None
+        n = len(points)
+
+        for _ in range(iterations):
+            idx = np.random.choice(n, size=4, replace=False)
+            sample = points[idx]
+
+            # Solve for sphere center from 4 points
+            # |p - c|^2 = r^2  =>  2*(p2-p1).c = |p2|^2 - |p1|^2
+            A = 2 * (sample[1:] - sample[0])
+            b = np.sum(sample[1:]**2, axis=1) - np.sum(sample[0]**2)
+
+            try:
+                center = np.linalg.solve(A, b)
+            except np.linalg.LinAlgError:
+                continue
+
+            radius = np.linalg.norm(sample[0] - center)
+            if radius < 1e-6:
+                continue
+
+            dists = np.linalg.norm(points - center, axis=1)
+            errors = np.abs(dists - radius)
+            inlier_mask = errors < thresh
+            count = inlier_mask.sum()
+
+            if count > best_count:
+                best_count = count
+                best_inliers = inlier_mask
+                best_params = (center, radius)
+
+        if best_params is None:
+            return None
+
+        # Refine
+        inlier_pts = points[best_inliers]
+        center_r = inlier_pts.mean(axis=0)
+        radius_r = np.median(np.linalg.norm(inlier_pts - center_r, axis=1))
+
+        dists_all = np.linalg.norm(points - center_r, axis=1)
+        final_mask = np.abs(dists_all - radius_r) < thresh
+
+        return (center_r, radius_r, final_mask)
+
+    @staticmethod
+    def fill_holes(input_path, output_path, shape_mode="auto",
+                   fill_density=1.0, ransac_threshold=1.0,
+                   grid_resolution=1.0, use_debug_color=False,
+                   debug_color=(0.2, 0.9, 0.3),
+                   manual_cylinder=None,
+                   log_callback=None, stop_check=None):
+        """Fill holes in a point cloud by fitting a geometric primitive and
+        generating synthetic points in the gap regions.
+
+        Parameters
+        ----------
+        input_path       : str — path to the source PLY file
+        output_path      : str — path to save the repaired PLY file
+        shape_mode       : 'auto', 'cylinder', 'sphere', or 'plane'
+                           Ignored when manual_cylinder is provided.
+        fill_density     : float — multiplier for fill point density (1.0 = match original)
+        ransac_threshold : float — distance tolerance for RANSAC inlier detection.
+                           When manual_cylinder is set, this is used only as the
+                           inlier tolerance for classifying which points belong to
+                           the manually-specified cylinder.
+        grid_resolution  : float — parameter-space grid cell size (smaller = finer fill)
+        use_debug_color  : bool — paint fill points a uniform debug color
+        debug_color      : tuple (R, G, B) in 0-1 range for debug coloring
+        manual_cylinder  : dict or None — if provided, bypasses RANSAC entirely.
+                           Keys expected:
+                             'axis'   : [ax, ay, az]  — unit vector along cylinder axis
+                             'center' : [cx, cy, cz]  — any point ON the axis (e.g. centroid of can)
+                             'radius' : float          — cylinder radius (same units as point cloud)
+        log_callback     : callable(str) for progress logging
+        stop_check       : callable() returning True to abort
+        """
+        def log(msg):
+            if log_callback:
+                log_callback(msg)
+            else:
+                print(msg)
+
+        if not os.path.exists(input_path):
+            raise FileNotFoundError(f"Input file not found: {input_path}")
+
+        log(f"Loading point cloud: {input_path}")
+        pcd = o3d.io.read_point_cloud(input_path)
+        if not pcd.has_points():
+            raise ValueError("Point cloud is empty.")
+
+        points = np.asarray(pcd.points)
+        has_colors = pcd.has_colors()
+        colors = np.asarray(pcd.colors) if has_colors else np.ones((len(points), 3)) * 0.8
+        n_original = len(points)
+
+        log(f"Loaded {n_original} points.  Has colors: {has_colors}")
+
+        # Estimate normals if needed
+        if not pcd.has_normals():
+            log("Estimating normals...")
+            pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(
+                radius=ransac_threshold * 3, max_nn=30))
+
+        # Compute average point spacing for density calculations
+        dists = pcd.compute_nearest_neighbor_distance()
+        avg_spacing = np.mean(dists)
+        log(f"Average point spacing: {avg_spacing:.4f}")
+
+        # Cache normals array for cylinder fitting (normal-voting requires them)
+        normals_arr = np.asarray(pcd.normals) if pcd.has_normals() else None
+
+        if stop_check and stop_check():
+            return
+
+        # ── Shape Fitting / Manual Override ───────────────────────────
+        results = {}
+
+        if manual_cylinder is not None:
+            # ── Manual cylinder parameters (bypass RANSAC) ────────────
+            log("Using manually specified cylinder parameters (RANSAC skipped).")
+            ax = np.array(manual_cylinder["axis"], dtype=float)
+            ax = ax / (np.linalg.norm(ax) + 1e-12)   # normalise
+            ctr = np.array(manual_cylinder["center"], dtype=float)
+            rad = float(manual_cylinder["radius"])
+
+            log(f"  Axis direction : [{ax[0]:.4f}, {ax[1]:.4f}, {ax[2]:.4f}]")
+            log(f"  Center point   : [{ctr[0]:.3f}, {ctr[1]:.3f}, {ctr[2]:.3f}]")
+            log(f"  Radius         : {rad:.3f}")
+
+            # Compute radial distance of every point from the specified axis
+            vecs = points - ctr
+            t_proj = np.dot(vecs, ax)
+            radial = np.linalg.norm(vecs - np.outer(t_proj, ax), axis=1)
+            cyl_mask = np.abs(radial - rad) < ransac_threshold
+
+            log(f"  Inliers within threshold {ransac_threshold}: "
+                f"{cyl_mask.sum()} ({cyl_mask.sum()/n_original*100:.1f}%)")
+
+            results["cylinder"] = {
+                "ratio":  cyl_mask.sum() / n_original,
+                "params": (ctr, ax, rad),
+                "mask":   cyl_mask,
+            }
+            best_shape = "cylinder"
+
+        else:
+            # ── Auto / RANSAC fitting ─────────────────────────────────
+            log("Fitting geometric primitives...")
+
+            # Try plane (using Open3D built-in)
+            if shape_mode in ("auto", "plane"):
+                log("  Trying Plane fit...")
+                try:
+                    plane_model, plane_inliers = pcd.segment_plane(
+                        distance_threshold=ransac_threshold, ransac_n=3,
+                        num_iterations=2000)
+                    plane_mask = np.zeros(n_original, dtype=bool)
+                    plane_mask[plane_inliers] = True
+                    plane_ratio = plane_mask.sum() / n_original
+                    results["plane"] = {
+                        "ratio": plane_ratio,
+                        "params": plane_model,
+                        "mask": plane_mask
+                    }
+                    log(f"  Plane: {plane_mask.sum()} inliers ({plane_ratio*100:.1f}%)")
+                except Exception as e:
+                    log(f"  Plane fit failed: {e}")
+
+            # Try cylinder
+            if shape_mode in ("auto", "cylinder"):
+                log("  Trying Cylinder fit...")
+                try:
+                    cyl = ProcessingLogic._fit_cylinder_ransac(
+                        points, ransac_threshold,
+                        normals=normals_arr,
+                        iterations=3000)
+                    if cyl is not None:
+                        cyl_center, cyl_axis, cyl_radius, cyl_mask = cyl
+                        cyl_ratio = cyl_mask.sum() / n_original
+                        results["cylinder"] = {
+                            "ratio": cyl_ratio,
+                            "params": (cyl_center, cyl_axis, cyl_radius),
+                            "mask": cyl_mask
+                        }
+                        log(f"  Cylinder: {cyl_mask.sum()} inliers ({cyl_ratio*100:.1f}%), "
+                            f"radius={cyl_radius:.3f}")
+                    else:
+                        log("  Cylinder: no fit found")
+                except Exception as e:
+                    log(f"  Cylinder fit failed: {e}")
+
+            # Try sphere
+            if shape_mode in ("auto", "sphere"):
+                log("  Trying Sphere fit...")
+                try:
+                    sph = ProcessingLogic._fit_sphere_ransac(
+                        points, ransac_threshold, iterations=3000)
+                    if sph is not None:
+                        sph_center, sph_radius, sph_mask = sph
+                        sph_ratio = sph_mask.sum() / n_original
+                        results["sphere"] = {
+                            "ratio": sph_ratio,
+                            "params": (sph_center, sph_radius),
+                            "mask": sph_mask
+                        }
+                        log(f"  Sphere: {sph_mask.sum()} inliers ({sph_ratio*100:.1f}%), "
+                            f"radius={sph_radius:.3f}")
+                    else:
+                        log("  Sphere: no fit found")
+                except Exception as e:
+                    log(f"  Sphere fit failed: {e}")
+
+            if not results:
+                raise ValueError("No geometric primitive could be fitted to the point cloud. "
+                                 "Try adjusting the RANSAC threshold, or switch to Manual mode.")
+
+            if stop_check and stop_check():
+                return
+
+            # Select best shape
+            if shape_mode == "auto":
+                best_shape = max(results, key=lambda k: results[k]["ratio"])
+                log(f"\nAuto-detected best shape: {best_shape.upper()} "
+                    f"({results[best_shape]['ratio']*100:.1f}% inliers)")
+            else:
+                if shape_mode not in results:
+                    raise ValueError(f"Shape '{shape_mode}' fitting failed.")
+                best_shape = shape_mode
+                log(f"\nUsing requested shape: {best_shape.upper()} "
+                    f"({results[best_shape]['ratio']*100:.1f}% inliers)")
+
+        shape_data = results[best_shape]
+        inlier_mask = shape_data["mask"]
+        inlier_pts = points[inlier_mask]
+
+        if stop_check and stop_check():
+            return
+
+        # ── Generate Fill Points ──────────────────────────────────────
+        log(f"Generating fill points for {best_shape}...")
+
+        fill_points = np.empty((0, 3))
+
+        if best_shape == "cylinder":
+            axis_pt, axis_dir, radius = shape_data["params"]
+
+
+            # ── Correct axis reference point ──────────────────────────
+            # axis_pt is the weighted centroid of inliers, which may not sit
+            # exactly on the axis. Project it ONTO the axis line so that
+            # h=0 is a well-defined reference and the cylinder is centred.
+            #
+            # The true axis is the line:  P(t) = axis_pt + t * axis_dir
+            # The foot of perpendicular from a point Q to this line is:
+            #   t_foot = dot(Q - axis_pt, axis_dir)
+            #   foot = axis_pt + t_foot * axis_dir
+            #
+            # We want axis_pt to be the foot of the INLIER centroid so h coords
+            # are naturally centred around 0.
+            inlier_centroid = inlier_pts.mean(axis=0)
+            t_foot = np.dot(inlier_centroid - axis_pt, axis_dir)
+            axis_origin = axis_pt + t_foot * axis_dir   # <-- this is now ON the axis
+
+            # Project inlier points onto cylinder parameter space (theta, h)
+            vecs = inlier_pts - axis_origin
+            h = np.dot(vecs, axis_dir)           # height along axis
+            radial = vecs - np.outer(h, axis_dir)  # radial components
+
+            # Build a stable local coordinate frame perpendicular to axis
+            if abs(np.dot(axis_dir, [1, 0, 0])) < 0.9:
+                perp = np.cross(axis_dir, [1, 0, 0])
+            else:
+                perp = np.cross(axis_dir, [0, 1, 0])
+            perp = perp / (np.linalg.norm(perp) + 1e-12)
+            perp2 = np.cross(axis_dir, perp)
+            perp2 = perp2 / (np.linalg.norm(perp2) + 1e-12)
+
+            # Compute theta for each inlier in [-pi, pi]
+            x_comp = np.dot(radial, perp)
+            y_comp = np.dot(radial, perp2)
+            theta = np.arctan2(y_comp, x_comp)
+
+            h_min, h_max = h.min(), h.max()
+
+            log(f"  Cylinder axis direction: [{axis_dir[0]:.3f}, {axis_dir[1]:.3f}, {axis_dir[2]:.3f}]")
+            log(f"  Cylinder radius: {radius:.3f}   Height range: [{h_min:.1f}, {h_max:.1f}]")
+            log(f"  Axis origin (on axis): [{axis_origin[0]:.2f}, {axis_origin[1]:.2f}, {axis_origin[2]:.2f}]")
+
+            # Build 2D occupancy grid in (theta, h) space
+            cell_size = grid_resolution * avg_spacing
+            n_theta = max(10, int(2 * np.pi * radius / cell_size))
+            n_h = max(5, int((h_max - h_min) / cell_size))
+
+            theta_bins = np.linspace(-np.pi, np.pi, n_theta + 1)
+            h_bins = np.linspace(h_min, h_max, n_h + 1)
+
+            # Count existing points in each cell
+            grid, _, _ = np.histogram2d(theta, h, bins=[theta_bins, h_bins])
+
+            # Identify hole cells: empty or very sparse compared to average
+            mean_density = grid[grid > 0].mean() if np.any(grid > 0) else 1
+            hole_threshold = max(1, mean_density * 0.1)
+            is_hole = grid < hole_threshold
+
+            # ── Dual interior-hole filter ─────────────────────────────
+            # We use two complementary methods.  A hole cell is "interior"
+            # (eligible to be filled) if it passes EITHER method.
+            #
+            # Method A — Flood-fill from h-edges (handles small/medium holes):
+            #   Start from all empty cells at h=0 and h=n_h-1.
+            #   BFS through connected empty cells (theta wraps).
+            #   Any hole NOT reached = enclosed interior hole.
+            #
+            # Method B — Per-theta-column vertical enclosure (handles LARGE
+            #   holes including half the cylinder missing):
+            #   For each theta column, find the first and last h row that has
+            #   real data.  Any empty cell BETWEEN those two rows in the same
+            #   column is a vertical interior hole — even if it spans the full
+            #   h range of the missing arc and Method A leaked through it.
+
+            # -- Method A: flood fill from h-boundaries --
+            from collections import deque
+
+            exterior = np.zeros((n_theta, n_h), dtype=bool)
+            q = deque()
+            for i_t in range(n_theta):
+                if is_hole[i_t, 0] and not exterior[i_t, 0]:
+                    exterior[i_t, 0] = True;  q.append((i_t, 0))
+                if is_hole[i_t, n_h-1] and not exterior[i_t, n_h-1]:
+                    exterior[i_t, n_h-1] = True;  q.append((i_t, n_h-1))
+
+            while q:
+                ct, ch = q.popleft()
+                for nt, nh in [((ct-1) % n_theta, ch),
+                                ((ct+1) % n_theta, ch),
+                                (ct, ch-1), (ct, ch+1)]:
+                    if nh < 0 or nh >= n_h:
+                        continue
+                    if not exterior[nt, nh] and is_hole[nt, nh]:
+                        exterior[nt, nh] = True
+                        q.append((nt, nh))
+
+            flood_interior = is_hole & ~exterior
+
+            # -- Method B: per-theta-column vertical enclosure --
+            # Pre-compute for each theta column: first and last h-row with data
+            # Vectorised with argmax tricks for speed
+            has_data = ~is_hole   # shape (n_theta, n_h)
+
+            col_interior = np.zeros((n_theta, n_h), dtype=bool)
+            for i_t in range(n_theta):
+                col = has_data[i_t]           # length n_h
+                if col.sum() < 2:
+                    continue                   # fewer than 2 data rows → skip
+                first_h = int(np.argmax(col))
+                last_h  = int(n_h - 1 - np.argmax(col[::-1]))
+                if last_h <= first_h:
+                    continue
+                # All hole cells strictly between first_h and last_h are interior
+                col_interior[i_t, first_h+1:last_h] = is_hole[i_t, first_h+1:last_h]
+
+            # Union of both methods
+            interior_mask_2d = flood_interior | col_interior
+
+            total_holes   = int(interior_mask_2d.sum())
+            total_cells   = n_theta * n_h
+            flood_count   = int(flood_interior.sum())
+            col_count     = int(col_interior.sum())
+            exterior_skip = int((is_hole & exterior).sum())
+            log(f"  Grid: {n_theta}x{n_h} = {total_cells} cells")
+            log(f"  Interior holes: {total_holes} "
+                f"(flood-fill: {flood_count}, column-enclosure: {col_count}, "
+                f"exterior skipped: {exterior_skip})")
+
+
+            if total_holes == 0:
+                log("  No interior holes detected. "
+                    "(Tip: if you expect holes, try decreasing the Grid Resolution parameter.)")
+            else:
+                pts_per_cell = max(1, int(mean_density * fill_density))
+                fill_list = []
+
+                for i_t in range(n_theta):
+                    for i_h in range(n_h):
+                        if not interior_mask_2d[i_t, i_h]:
+                            continue
+                        t_center = (theta_bins[i_t] + theta_bins[i_t + 1]) / 2
+                        h_center = (h_bins[i_h] + h_bins[i_h + 1]) / 2
+                        t_spread = theta_bins[i_t + 1] - theta_bins[i_t]
+                        h_spread = h_bins[i_h + 1] - h_bins[i_h]
+
+                        for _ in range(pts_per_cell):
+                            t_r = t_center + (np.random.random() - 0.5) * t_spread
+                            h_r = h_center + (np.random.random() - 0.5) * h_spread
+
+                            # Convert back to 3D using corrected axis_origin
+                            pt_3d = (axis_origin
+                                     + h_r * axis_dir
+                                     + radius * np.cos(t_r) * perp
+                                     + radius * np.sin(t_r) * perp2)
+                            fill_list.append(pt_3d)
+
+                if fill_list:
+                    fill_points = np.array(fill_list)
+
+        elif best_shape == "sphere":
+            center, radius = shape_data["params"]
+
+            # Parameterize in spherical coords (theta, phi)
+            vecs = inlier_pts - center
+            r_dist = np.linalg.norm(vecs, axis=1)
+            theta = np.arctan2(vecs[:, 1], vecs[:, 0])  # azimuth [-pi, pi]
+            phi = np.arccos(np.clip(vecs[:, 2] / (r_dist + 1e-12), -1, 1))  # polar [0, pi]
+
+            cell_size = grid_resolution * avg_spacing
+            n_theta = max(10, int(2 * np.pi * radius / cell_size))
+            n_phi = max(5, int(np.pi * radius / cell_size))
+
+            theta_bins = np.linspace(-np.pi, np.pi, n_theta + 1)
+            phi_bins = np.linspace(0, np.pi, n_phi + 1)
+
+            grid, _, _ = np.histogram2d(theta, phi, bins=[theta_bins, phi_bins])
+
+            mean_density = grid[grid > 0].mean() if np.any(grid > 0) else 1
+            hole_threshold = max(1, mean_density * 0.1)
+            hole_mask_2d = grid < hole_threshold
+
+            total_holes = hole_mask_2d.sum()
+            log(f"  Grid: {n_theta}×{n_phi}, {total_holes} hole cells")
+
+            if total_holes > 0:
+                pts_per_cell = max(1, int(mean_density * fill_density))
+                fill_list = []
+
+                for i_t in range(n_theta):
+                    for i_p in range(n_phi):
+                        if not hole_mask_2d[i_t, i_p]:
+                            continue
+                        t_center = (theta_bins[i_t] + theta_bins[i_t + 1]) / 2
+                        p_center = (phi_bins[i_p] + phi_bins[i_p + 1]) / 2
+                        t_spread = theta_bins[i_t + 1] - theta_bins[i_t]
+                        p_spread = phi_bins[i_p + 1] - phi_bins[i_p]
+
+                        for _ in range(pts_per_cell):
+                            t_r = t_center + (np.random.random() - 0.5) * t_spread
+                            p_r = p_center + (np.random.random() - 0.5) * p_spread
+
+                            pt_3d = center + radius * np.array([
+                                np.sin(p_r) * np.cos(t_r),
+                                np.sin(p_r) * np.sin(t_r),
+                                np.cos(p_r)
+                            ])
+                            fill_list.append(pt_3d)
+
+                if fill_list:
+                    fill_points = np.array(fill_list)
+
+        elif best_shape == "plane":
+            a, b, c, d = shape_data["params"]
+            normal = np.array([a, b, c])
+            normal = normal / (np.linalg.norm(normal) + 1e-12)
+
+            # Build local 2D coordinate frame on the plane
+            if abs(np.dot(normal, [1, 0, 0])) < 0.9:
+                u = np.cross(normal, [1, 0, 0])
+            else:
+                u = np.cross(normal, [0, 1, 0])
+            u = u / (np.linalg.norm(u) + 1e-12)
+            v = np.cross(normal, u)
+            v = v / (np.linalg.norm(v) + 1e-12)
+
+            # Project inlier points to 2D plane coordinates
+            centroid = inlier_pts.mean(axis=0)
+            vecs = inlier_pts - centroid
+            u_coords = np.dot(vecs, u)
+            v_coords = np.dot(vecs, v)
+
+            cell_size = grid_resolution * avg_spacing
+            u_min, u_max = u_coords.min(), u_coords.max()
+            v_min, v_max = v_coords.min(), v_coords.max()
+
+            n_u = max(5, int((u_max - u_min) / cell_size))
+            n_v = max(5, int((v_max - v_min) / cell_size))
+
+            u_bins = np.linspace(u_min, u_max, n_u + 1)
+            v_bins = np.linspace(v_min, v_max, n_v + 1)
+
+            grid, _, _ = np.histogram2d(u_coords, v_coords, bins=[u_bins, v_bins])
+
+            mean_density = grid[grid > 0].mean() if np.any(grid > 0) else 1
+            hole_threshold = max(1, mean_density * 0.1)
+
+            # For planes, only fill cells that are INTERIOR holes (surrounded by existing points)
+            # Use a convex hull approach: mark cells as "inside" if they are within
+            # the bounding region of existing data
+            from scipy.spatial import ConvexHull, Delaunay
+            try:
+                hull_pts_2d = np.column_stack([u_coords, v_coords])
+                hull = ConvexHull(hull_pts_2d)
+                delaunay = Delaunay(hull_pts_2d[hull.vertices])
+
+                # Test which cell centers are inside the convex hull
+                u_centers = (u_bins[:-1] + u_bins[1:]) / 2
+                v_centers = (v_bins[:-1] + v_bins[1:]) / 2
+                grid_u, grid_v = np.meshgrid(u_centers, v_centers, indexing='ij')
+                test_pts = np.column_stack([grid_u.ravel(), grid_v.ravel()])
+                inside = delaunay.find_simplex(test_pts) >= 0
+                inside_grid = inside.reshape(n_u, n_v)
+
+                hole_mask_2d = (grid < hole_threshold) & inside_grid
+            except Exception:
+                hole_mask_2d = grid < hole_threshold
+
+            total_holes = hole_mask_2d.sum()
+            log(f"  Grid: {n_u}×{n_v}, {total_holes} hole cells")
+
+            if total_holes > 0:
+                pts_per_cell = max(1, int(mean_density * fill_density))
+                fill_list = []
+
+                for i_u in range(n_u):
+                    for i_v in range(n_v):
+                        if not hole_mask_2d[i_u, i_v]:
+                            continue
+                        uc = (u_bins[i_u] + u_bins[i_u + 1]) / 2
+                        vc = (v_bins[i_v] + v_bins[i_v + 1]) / 2
+                        u_s = u_bins[i_u + 1] - u_bins[i_u]
+                        v_s = v_bins[i_v + 1] - v_bins[i_v]
+
+                        for _ in range(pts_per_cell):
+                            ur = uc + (np.random.random() - 0.5) * u_s
+                            vr = vc + (np.random.random() - 0.5) * v_s
+                            pt_3d = centroid + ur * u + vr * v
+                            fill_list.append(pt_3d)
+
+                if fill_list:
+                    fill_points = np.array(fill_list)
+
+        n_fill = len(fill_points)
+        log(f"\nGenerated {n_fill} fill points.")
+
+        if n_fill == 0:
+            log("No holes to fill. Saving original cloud as-is.")
+            o3d.io.write_point_cloud(output_path, pcd)
+            return
+
+        if stop_check and stop_check():
+            return
+
+        # ── Color Transfer ────────────────────────────────────────────
+        log("Transferring colors to fill points...")
+
+        if use_debug_color:
+            fill_colors = np.tile(np.array(debug_color), (n_fill, 1))
+            log(f"  Using debug color: RGB({debug_color[0]:.1f}, {debug_color[1]:.1f}, {debug_color[2]:.1f})")
+        else:
+            # For each fill point, find K nearest existing points and average their color
+            tree = o3d.geometry.KDTreeFlann(pcd)
+            fill_colors = np.zeros((n_fill, 3))
+            k_neighbors = 8
+
+            for i in range(n_fill):
+                [_, idx, _] = tree.search_knn_vector_3d(fill_points[i], k_neighbors)
+                fill_colors[i] = colors[idx].mean(axis=0)
+
+            log(f"  Color transferred from {k_neighbors} nearest neighbors per fill point.")
+
+        # ── Merge & Save ──────────────────────────────────────────────
+        log("Merging original + fill points...")
+
+        merged_pts = np.vstack([points, fill_points])
+        merged_colors = np.vstack([colors, fill_colors])
+
+        pcd_merged = o3d.geometry.PointCloud()
+        pcd_merged.points = o3d.utility.Vector3dVector(merged_pts)
+        pcd_merged.colors = o3d.utility.Vector3dVector(merged_colors)
+
+        # Estimate normals for the final cloud
+        log("Estimating normals for merged cloud...")
+        pcd_merged.estimate_normals(
+            search_param=o3d.geometry.KDTreeSearchParamHybrid(
+                radius=avg_spacing * 3, max_nn=30))
+
+        o3d.io.write_point_cloud(output_path, pcd_merged)
+        log(f"")
+        log(f"[DONE] Saved repaired point cloud to: {output_path}")
+        log(f"  Original: {n_original} pts  |  Fill: {n_fill} pts  |  Total: {len(merged_pts)} pts")
+
 
