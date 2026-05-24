@@ -153,6 +153,7 @@ class ScannerGUI:
         # to propagate the outward direction through the neighborhood graph, fixing stray normals
         self.s_consistency_pass = tk.BooleanVar(value=False)   # Enable/disable consistency pass
         self.s_consistency_k = tk.IntVar(value=30)             # Number of neighbors for the pass
+        self.s_strict_centroid = tk.BooleanVar(value=False)    # Enforce centroid outward check again after consistency pass
         # MeshLab post-processing via pymeshlab
         self.s_use_meshlab = tk.BooleanVar(value=False)
         self.s_ml_smooth_type = tk.StringVar(value="taubin")   # 'taubin' or 'laplacian'
@@ -207,6 +208,11 @@ class ScannerGUI:
         self.fix_man_cy = tk.StringVar(value="0")
         self.fix_man_cz = tk.StringVar(value="0")
         self.fix_man_radius = tk.StringVar(value="0")
+        # Interactive cylinder finder (2-plane method)
+        self.fix_plane1_pts = []    # list of 3 [x,y,z] picked for plane 1
+        self.fix_plane2_pts = []    # list of 3 [x,y,z] picked for plane 2
+        self.fix_slice_thick = tk.DoubleVar(value=3.0)
+        self.fix_show_picker = tk.BooleanVar(value=False)
 
         # --- Camera Mode (Web Frontend vs Android Native) ---
         self.camera_mode = tk.StringVar(value="web")  # 'web' or 'android'
@@ -1005,6 +1011,13 @@ class ScannerGUI:
         ttk.Label(self._frm_centroid,
             text="    ⚠ On very noisy clouds the consistency pass may re-flip some correct normals — use with care.",
             foreground="#886600", justify=tk.LEFT).pack(anchor=tk.W, padx=12, pady=(0, 4))
+            
+        f_strict = ttk.Frame(self._frm_centroid); f_strict.pack(fill=tk.X, padx=12, pady=2)
+        ttk.Checkbutton(f_strict,
+            text="Strict Centroid Enforce (Fix Sharp Edges)",
+            variable=self.s_strict_centroid).pack(side=tk.LEFT)
+        ttk.Label(f_strict, text="(Runs centroid fix again after consistency pass to prevent flat surfaces flipping inward)",
+                  foreground="#555").pack(side=tk.LEFT)
 
         self._update_unified_norm_ui()   # set initial visibility
 
@@ -1271,6 +1284,7 @@ class ScannerGUI:
             use_centroid    = (normal_mode == "centroid")
             use_consistency = self.s_consistency_pass.get() if use_centroid else False
             consistency_k   = self.s_consistency_k.get()
+            strict_centroid = self.s_strict_centroid.get() if use_centroid else False
 
             meshlab_params = None
             if self.s_use_meshlab.get():
@@ -1297,7 +1311,8 @@ class ScannerGUI:
                         consistency_pass=use_consistency,
                         consistency_k=consistency_k,
                         meshlab_params=meshlab_params,
-                        save_normals_path=save_normals_path
+                        save_normals_path=save_normals_path,
+                        strict_centroid=strict_centroid
                     )
                     if stop.is_set():
                         self._close_progress_popup(popup); return
@@ -1315,6 +1330,7 @@ class ScannerGUI:
                             consistency_k=consistency_k,
                             meshlab_params=meshlab_params,
                             save_normals_path=save_normals_path,
+                            strict_centroid=strict_centroid,
                         ))
                 except Exception as e:
                     log(f"ERROR: {e}")
@@ -1327,7 +1343,7 @@ class ScannerGUI:
 
     def _show_centroid_inspector(self, in_file, out_file, mode_str, params,
                                   use_consistency, consistency_k,
-                                  meshlab_params, save_normals_path):
+                                  meshlab_params, save_normals_path, strict_centroid):
         """Interactive popup: shows the input point cloud (white) + centroid (red).
         The user can drag X/Y/Z sliders to reposition the centroid and then
         click Recalculate & Reconstruct to re-run the whole pipeline with the
@@ -1549,6 +1565,7 @@ class ScannerGUI:
                         meshlab_params=meshlab_params,
                         save_normals_path=save_normals_path,
                         custom_center=custom,
+                        strict_centroid=strict_centroid,
                     )
                     if stop2.is_set():
                         self._close_progress_popup(popup2); return
@@ -1952,6 +1969,77 @@ class ScannerGUI:
                 lf_manual.pack(fill=tk.X, padx=8, pady=4)
             else:
                 lf_manual.pack_forget()
+
+        # ── 2c. Interactive Cylinder Finder (2-plane method) ─────────
+        lf_picker_outer = ttk.LabelFrame(root, text="2c. Interactive Cylinder Finder  (2-Plane Method)")
+        lf_picker_outer.pack(fill=tk.X, padx=10, pady=5)
+
+        f_pick_toggle = ttk.Frame(lf_picker_outer); f_pick_toggle.pack(fill=tk.X, padx=8, pady=4)
+        ttk.Checkbutton(
+            f_pick_toggle,
+            text="Enable Interactive Cylinder Finder  "
+                 "(pick points directly on the 3-D point cloud to define the cylinder)",
+            variable=self.fix_show_picker,
+            command=lambda: _toggle_picker()
+        ).pack(side=tk.LEFT)
+
+        # Inner frame shown only when checkbox is ON
+        lf_picker = ttk.Frame(lf_picker_outer)
+
+        ttk.Label(lf_picker,
+                  text=(
+                      "HOW IT WORKS:\n"
+                      "  1. Click \"Pick Plane 1\" → a 3-D window opens (your full point cloud is shown).\n"
+                      "     Shift+Click  3 points anywhere on the SIDE of the cylinder (not the cap).\n"
+                      "     Close the window when done.\n"
+                      "  2. Click \"Pick Plane 2\" → pick 3 more points on a DIFFERENT part of the side.\n"
+                      "     The two sets of points must be at clearly different angles around the cylinder.\n"
+                      "  3. Click \"Compute → Fill Fields\".  The algorithm finds the axis, centre and radius\n"
+                      "     from the geometry of the two planes and auto-fills the Manual Parameters above."
+                  ),
+                  foreground="#004488", justify=tk.LEFT,
+                  font=("Arial", 8), wraplength=680).pack(padx=8, pady=(4, 6))
+
+        # Status labels
+        self._fix_p1_status = tk.StringVar(value="Plane 1:  not picked")
+        self._fix_p2_status = tk.StringVar(value="Plane 2:  not picked")
+
+        # Plane 1 row
+        f_p1 = ttk.Frame(lf_picker); f_p1.pack(fill=tk.X, padx=8, pady=3)
+        ttk.Button(f_p1, text="Pick Plane 1  (Shift+Click 3 pts)",
+                   command=lambda: self._fix_pick_plane(1)).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Label(f_p1, textvariable=self._fix_p1_status,
+                  foreground="#444", font=("Arial", 8)).pack(side=tk.LEFT)
+
+        # Plane 2 row
+        f_p2 = ttk.Frame(lf_picker); f_p2.pack(fill=tk.X, padx=8, pady=3)
+        ttk.Button(f_p2, text="Pick Plane 2  (Shift+Click 3 pts)",
+                   command=lambda: self._fix_pick_plane(2)).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Label(f_p2, textvariable=self._fix_p2_status,
+                  foreground="#444", font=("Arial", 8)).pack(side=tk.LEFT)
+
+        # Slice thickness
+        f_st = ttk.Frame(lf_picker); f_st.pack(fill=tk.X, padx=8, pady=3)
+        ttk.Label(f_st, text="Slice Thickness (±):").pack(side=tk.LEFT)
+        ttk.Entry(f_st, textvariable=self.fix_slice_thick, width=8).pack(side=tk.LEFT, padx=5)
+        ttk.Label(f_st,
+                  text="How thick (in point-cloud units) the cross-section slab is.\n"
+                       "Make it larger if too few points are found. Smaller = more precise circle.",
+                  foreground="#777", font=("Arial", 8)).pack(side=tk.LEFT, padx=4)
+
+        # Compute button
+        ttk.Button(
+            lf_picker,
+            text="📏  Compute → Fill Axis / Center / Radius  (uses the 2 picked planes)",
+            command=lambda: self._fix_compute_cylinder()
+        ).pack(fill=tk.X, padx=8, pady=8)
+
+        def _toggle_picker():
+            if self.fix_show_picker.get():
+                lf_picker.pack(fill=tk.X, padx=4, pady=(0, 6))
+            else:
+                lf_picker.pack_forget()
+
 
         # ── 3. Fill Parameters ────────────────────────────────────────
         lf_params = ttk.LabelFrame(root, text="3. Fill Parameters")
@@ -3444,8 +3532,169 @@ class ScannerGUI:
                 
         threading.Thread(target=run, daemon=True).start()
 
+    # ── Fix tab helper methods ────────────────────────────────────────────
+
+    def _fix_pick_plane(self, plane_num):
+        """Open an Open3D point-picker window so the user can Shift+Click
+        exactly 3 points on the cylinder side surface.  Stores the picked
+        world-space coordinates in self.fix_plane1_pts or fix_plane2_pts."""
+        import threading
+
+        in_file = self.fix_input_ply.get().strip()
+        if not in_file or not os.path.isfile(in_file):
+            messagebox.showerror(
+                "No Input File",
+                "Please select the input .PLY file first (section 1. Files).")
+            return
+
+        status_var = self._fix_p1_status if plane_num == 1 else self._fix_p2_status
+        status_var.set(f"Plane {plane_num}:  opening 3-D window…")
+
+        def pick():
+            try:
+                import open3d as o3d
+                import numpy as np
+
+                pcd = o3d.io.read_point_cloud(in_file)
+                if not pcd.has_colors():
+                    pcd.paint_uniform_color([0.7, 0.7, 0.7])
+
+                vis = o3d.visualization.VisualizerWithEditing()
+                vis.create_window(
+                    window_name=f"Pick 3 points for Plane {plane_num}  "
+                                f"— Shift+Click to select, then close the window",
+                    width=1100, height=750)
+                vis.add_geometry(pcd)
+
+                # Render options: make points bigger so they are easier to click
+                opt = vis.get_render_option()
+                opt.point_size = 3.0
+                opt.background_color = [0.12, 0.12, 0.15]
+
+                vis.run()          # blocks until window is closed
+                vis.destroy_window()
+
+                picked_idx = vis.get_picked_points()
+                pts_arr = np.asarray(pcd.points)
+
+                if len(picked_idx) < 3:
+                    self.root.after(0, lambda: messagebox.showwarning(
+                        "Not Enough Points",
+                        f"You picked {len(picked_idx)} point(s) but need exactly 3.\n"
+                        "Re-open the picker and Shift+Click 3 points on the cylinder side."))
+                    status_var.set(
+                        f"Plane {plane_num}:  ❌ only {len(picked_idx)} point(s) — need 3")
+                    return
+
+                # Use only the first 3 if the user picked more
+                selected = pts_arr[list(picked_idx[:3])]
+                coords = selected.tolist()
+
+                if plane_num == 1:
+                    self.fix_plane1_pts = coords
+                else:
+                    self.fix_plane2_pts = coords
+
+                # Build a compact status string
+                def fmt(p):
+                    return f"({p[0]:.2f}, {p[1]:.2f}, {p[2]:.2f})"
+                status_var.set(
+                    f"Plane {plane_num}:  ✓  "
+                    f"{fmt(coords[0])}  {fmt(coords[1])}  {fmt(coords[2])}")
+
+            except Exception as ex:
+                import traceback
+                err = traceback.format_exc()
+                self.root.after(0, lambda: messagebox.showerror(
+                    "Pick Error", f"{ex}\n\n{err}"))
+                status_var.set(f"Plane {plane_num}:  ERROR — {ex}")
+
+        threading.Thread(target=pick, daemon=True).start()
+
+    def _fix_compute_cylinder(self):
+        """Compute axis/center/radius from the two picked planes and fill
+        the Manual Parameters fields.  Also switches detection mode to 'manual'."""
+        if len(self.fix_plane1_pts) < 3:
+            messagebox.showerror(
+                "Plane 1 Missing",
+                "Please pick Plane 1 first (3 points on the cylinder side).")
+            return
+        if len(self.fix_plane2_pts) < 3:
+            messagebox.showerror(
+                "Plane 2 Missing",
+                "Please pick Plane 2 first (3 points on the cylinder side at a different angle).")
+            return
+
+        try:
+            import numpy as np
+            import open3d as o3d
+            from processing import ProcessingLogic
+
+            in_file = self.fix_input_ply.get().strip()
+            if not in_file or not os.path.isfile(in_file):
+                messagebox.showerror("No Input File",
+                    "Please select the input .PLY file first.")
+                return
+
+            pcd = o3d.io.read_point_cloud(in_file)
+            points = np.asarray(pcd.points)
+
+            thickness = self.fix_slice_thick.get()
+
+            result = ProcessingLogic.find_cylinder_from_planes(
+                points=points,
+                plane1_pts=self.fix_plane1_pts,
+                plane2_pts=self.fix_plane2_pts,
+                slice_thickness=thickness,
+            )
+
+            ax  = result["axis"]
+            ctr = result["center"]
+            rad = result["radius"]
+            rms = result["rms"]
+            sc  = result["slice_count"]
+            N1  = result["N1"]
+            N2  = result["N2"]
+
+            # Fill Manual Parameters fields
+            self.fix_man_axis_x.set(f"{ax[0]:.6f}")
+            self.fix_man_axis_y.set(f"{ax[1]:.6f}")
+            self.fix_man_axis_z.set(f"{ax[2]:.6f}")
+            self.fix_man_cx.set(f"{ctr[0]:.4f}")
+            self.fix_man_cy.set(f"{ctr[1]:.4f}")
+            self.fix_man_cz.set(f"{ctr[2]:.4f}")
+            self.fix_man_radius.set(f"{rad:.4f}")
+
+            # Switch to Manual mode so the values are used
+            self.fix_detection_mode.set("manual")
+            # Trigger the toggle so the manual frame becomes visible
+            if hasattr(self, '_fix_toggle_manual'):
+                self._fix_toggle_manual()
+
+            quality = "✅ Good" if rms < rad * 0.05 else ("⚠ Fair" if rms < rad * 0.15 else "❌ Poor — try picking different points")
+            messagebox.showinfo(
+                "Cylinder Found",
+                f"Two-plane cylinder computation succeeded!\n\n"
+                f"  Plane 1 normal : [{N1[0]:.4f}, {N1[1]:.4f}, {N1[2]:.4f}]\n"
+                f"  Plane 2 normal : [{N2[0]:.4f}, {N2[1]:.4f}, {N2[2]:.4f}]\n"
+                f"  Axis direction : [{ax[0]:.4f}, {ax[1]:.4f}, {ax[2]:.4f}]\n"
+                f"  Centre (3-D)   : [{ctr[0]:.2f}, {ctr[1]:.2f}, {ctr[2]:.2f}]\n"
+                f"  Radius         : {rad:.4f}\n"
+                f"  Circle fit RMS : {rms:.4f}  {quality}\n"
+                f"  Points in slab : {sc}\n\n"
+                "The Manual Parameters fields above have been filled in.\n"
+                "Detection mode is now set to 'Manual'.\n"
+                "You can adjust the values if needed, then click ▶ FIX HOLES.")
+
+        except Exception as ex:
+            import traceback
+            messagebox.showerror(
+                "Compute Error",
+                f"{ex}\n\n{traceback.format_exc()}")
+
     def do_fix_holes(self):
         """Run Tab 10: Fix — fill holes in a point cloud."""
+
         in_file = self.fix_input_ply.get().strip()
         out_file = self.fix_output_ply.get().strip()
 

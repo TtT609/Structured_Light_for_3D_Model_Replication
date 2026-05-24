@@ -717,7 +717,7 @@ class ProcessingLogic:
         print(f"[Merge 360] Saved merged cloud to {output_path}")
 
     @staticmethod
-    def reconstruct_stl(input_path, output_path, mode="watertight", params=None, centroid_orient=True, consistency_pass=False, consistency_k=30, meshlab_params=None, save_normals_path=None, custom_center=None):
+    def reconstruct_stl(input_path, output_path, mode="watertight", params=None, centroid_orient=True, consistency_pass=False, consistency_k=30, meshlab_params=None, save_normals_path=None, custom_center=None, strict_centroid=False):
         # Function used to create a 3D wireframe or solid mesh (STL from Point Cloud), suitable for 3D printing tasks
         # centroid_orient:   When True, calculates the geometric center of all points and forces every
         #                    normal to point OUTWARD from that center. More reliable than graph-consistency.
@@ -784,6 +784,18 @@ class ProcessingLogic:
             print(f"[Recon] Consistency pass: orient_normals_consistent_tangent_plane(k={k})...")
             pcd.orient_normals_consistent_tangent_plane(k)
             print("[Recon] Consistency pass applied.")
+
+            if centroid_orient and strict_centroid:
+                print("[Recon] Applying strict centroid enforce after consistency pass...")
+                pts = np.asarray(pcd.points)
+                norms = np.asarray(pcd.normals).copy()
+                to_point = pts - center
+                dots = np.einsum('ij,ij->i', norms, to_point)
+                inward_mask = dots < 0
+                norms[inward_mask] *= -1.0
+                pcd.normals = o3d.utility.Vector3dVector(norms)
+                flipped = int(inward_mask.sum())
+                print(f"[Recon] Strict centroid enforce flipped {flipped} stray normals outward.")
 
         # Optionally save the point cloud with normals embedded, BEFORE meshing
         # Allows the user to open the result in CloudCompare / MeshLab and verify normals face outward
@@ -1407,12 +1419,156 @@ class ProcessingLogic:
         return (center_r, radius_r, final_mask)
 
     @staticmethod
+    def find_cylinder_from_planes(points, plane1_pts, plane2_pts,
+                                  slice_thickness=3.0):
+        """Find a cylinder's axis, centre, and radius from two user-picked
+        sets of 3 points on the cylinder's curved side surface.
+
+        Geometric method
+        ----------------
+        The user picks 3 points on each visible arc of the cylinder.
+        Each set of 3 points defines a "secant plane" that cuts through
+        the cylinder lengthwise (i.e. it contains the cylinder axis).
+        The normal to such a plane is therefore PERPENDICULAR to the axis.
+
+        So:   axis = cross(N1, N2)
+
+        where N1 is the normal to the plane through the first 3 points and
+        N2 is the normal to the plane through the second 3 points.
+
+        Picking advice
+        --------------
+        Pick 3 points that SPAN THE HEIGHT of the cylinder on each side.
+        For example: one point near the top, one in the middle, one near
+        the bottom of the visible arc.  Do NOT pick 3 points at the same
+        height — that gives a horizontal plane whose normal is vertical
+        (i.e. along the axis), which would give wrong results.
+
+        After the axis is determined, the algorithm:
+          1. Slices a thin cross-section slab perpendicular to the axis.
+          2. Projects the slab points into 2-D.
+          3. Fits a circle by algebraic least squares to find radius+centre.
+        """
+        p1 = np.asarray(plane1_pts, dtype=float)   # (3, 3)
+        p2 = np.asarray(plane2_pts, dtype=float)   # (3, 3)
+
+        # ── Plane normals ─────────────────────────────────────────────
+        def _plane_normal(pts):
+            v1 = pts[1] - pts[0]
+            v2 = pts[2] - pts[0]
+            n  = np.cross(v1, v2)
+            ln = np.linalg.norm(n)
+            if ln < 1e-9:
+                return None, ln
+            return n / ln, ln
+
+        N1, ln1 = _plane_normal(p1)
+        N2, ln2 = _plane_normal(p2)
+
+        if N1 is None:
+            raise ValueError(
+                "Plane 1 points are (nearly) collinear — the 3 points must not "
+                "all lie on the same straight line.  Pick 3 points spread around "
+                "the arc (different X AND different Z).")
+        if N2 is None:
+            raise ValueError(
+                "Plane 2 points are (nearly) collinear — same issue with Plane 2.")
+
+        # ── Axis from cross product ───────────────────────────────────
+        axis = np.cross(N1, N2)
+        axis_len = np.linalg.norm(axis)
+
+        if axis_len < 0.05:
+            # Two sub-cases:
+            #  a) N1 ≈ N2  → truly parallel planes (both same side) → error
+            #  b) N1 ≈ -N2 → anti-parallel (user picked symmetric opposite sides)
+            #     In this case N1 ⊥ axis, so we can find axis as:
+            #     axis = cross(N1, direction_from_p1_centre_to_p2_centre)
+            dot_n = float(np.dot(N1, N2))
+            if dot_n < -0.9:
+                # Anti-parallel: use centroid-to-centroid as secondary constraint
+                diam = p2.mean(axis=0) - p1.mean(axis=0)  # approx diameter direction
+                diam_len = np.linalg.norm(diam)
+                if diam_len > 1e-6:
+                    axis = np.cross(N1, diam / diam_len)
+                    axis_len = np.linalg.norm(axis)
+
+            if axis_len < 0.05:
+                raise ValueError(
+                    "Could not determine the cylinder axis from the two planes.\n\n"
+                    "This usually happens when both sets of points are at the SAME "
+                    "angular position on the can (e.g. both on the front arc).\n\n"
+                    "FIX: For Plane 1 pick 3 points on one visible side (e.g. left arc).\n"
+                    "     For Plane 2 pick 3 points on a DIFFERENT side at roughly 90°\n"
+                    "     from Plane 1 (e.g. right arc or top arc).\n\n"
+                    f"N1={[round(x,3) for x in N1.tolist()]}  "
+                    f"N2={[round(x,3) for x in N2.tolist()]}  "
+                    f"|cross|={axis_len:.4f}")
+
+        axis = axis / np.linalg.norm(axis)
+
+        # ── Cross-section slab ────────────────────────────────────────
+        # Origin = centroid of all 6 picked points
+        centroid_picked = np.vstack([p1, p2]).mean(axis=0)
+
+        vecs = points - centroid_picked
+        h    = np.dot(vecs, axis)
+        slice_mask = np.abs(h) < slice_thickness
+        slice_pts  = points[slice_mask]
+
+        if len(slice_pts) < 5:
+            raise ValueError(
+                f"Only {len(slice_pts)} points in the cross-section slab "
+                f"(±{slice_thickness} along the axis).  "
+                "Try increasing the Slice Thickness value.")
+
+        # ── Project into 2-D cross-section ───────────────────────────
+        if abs(np.dot(axis, [1, 0, 0])) < 0.9:
+            perp1 = np.cross(axis, [1, 0, 0])
+        else:
+            perp1 = np.cross(axis, [0, 1, 0])
+        perp1 = perp1 / np.linalg.norm(perp1)
+        perp2 = np.cross(axis, perp1)
+        perp2 = perp2 / np.linalg.norm(perp2)
+
+        sv  = slice_pts - centroid_picked
+        sh  = np.dot(sv, axis)
+        sr  = sv - np.outer(sh, axis)
+        x2d = np.dot(sr, perp1)
+        y2d = np.dot(sr, perp2)
+
+        # ── Algebraic circle fit ──────────────────────────────────────
+        # (x-cx)²+(y-cy)² = r²  →  2cx·x + 2cy·y + (r²-cx²-cy²) = x²+y²
+        A   = np.column_stack([2*x2d, 2*y2d, np.ones(len(x2d))])
+        b   = x2d**2 + y2d**2
+        sol, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
+        cx_2d, cy_2d, D = sol
+        radius = float(np.sqrt(max(0.0, D + cx_2d**2 + cy_2d**2)))
+
+        radii = np.sqrt((x2d - cx_2d)**2 + (y2d - cy_2d)**2)
+        rms   = float(np.sqrt(np.mean((radii - radius)**2)))
+
+        center_3d = centroid_picked + cx_2d * perp1 + cy_2d * perp2
+
+        return {
+            "axis":        axis.tolist(),
+            "center":      center_3d.tolist(),
+            "radius":      radius,
+            "N1":          N1.tolist(),
+            "N2":          N2.tolist(),
+            "slice_count": int(slice_mask.sum()),
+            "rms":         rms,
+            "method_used": "cross(N1,N2) + circle-fit",
+        }
+
+    @staticmethod
     def fill_holes(input_path, output_path, shape_mode="auto",
                    fill_density=1.0, ransac_threshold=1.0,
                    grid_resolution=1.0, use_debug_color=False,
                    debug_color=(0.2, 0.9, 0.3),
                    manual_cylinder=None,
                    log_callback=None, stop_check=None):
+
         """Fill holes in a point cloud by fitting a geometric primitive and
         generating synthetic points in the gap regions.
 
