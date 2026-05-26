@@ -1,8 +1,8 @@
 #include <Stepper.h>
 
-// 2048 steps for a full 360 degree rotation
-const int stepsPerRevolution = 2048; 
-const int steptarget = 969; 
+// 17500 steps for a full 360 degree rotation
+const int stepsPerRevolution = 17500; 
+
 
 
 // Initialize pins: IN1, IN3, IN2, IN4 (Specific order for ULN2003)
@@ -30,7 +30,7 @@ void loop() {
     // If the angle is valid, execute the movement
     if (degrees > 0) {
       // Calculate how many steps the motor needs to move for that angle
-      long stepsToMove = (degrees / 30.0) * steptarget;
+      long stepsToMove = (degrees / 360.0) * stepsPerRevolution;
       
       Serial.print("Moving ");
       Serial.print(degrees);
