@@ -46,7 +46,6 @@ class ScannerGUI:
         # --- State Variables (Multi PLY Process - Tab 2) ---
         self.mpcp_calib_file  = tk.StringVar(value=os.path.join(DEFAULT_ROOT, "calib", "calib.mat"))
         self.mpcp_input_path  = tk.StringVar()
-        self.mpcp_mode        = tk.StringVar(value="single")  # 'single' | 'files'
         self.mpcp_batch       = tk.BooleanVar(value=False)
 
         # How many of the FIRST (coarsest) bit-planes to use per axis (1-11, default 11 = all)
@@ -61,8 +60,6 @@ class ScannerGUI:
         self.mpcp_thresh_mode = tk.StringVar(value="otsu") # otsu or manual
         self.mpcp_shadow_val = tk.StringVar(value="40")
         self.mpcp_contrast_val = tk.StringVar(value="10")
-
-        self.mpcp_selected_files = []  # used when mode == 'files'
         
         # --- State Variables (Combined Processing - Tab 3) ---
         # Toggle: process a single file or an entire folder batch
@@ -301,36 +298,15 @@ class ScannerGUI:
         lf2 = ttk.LabelFrame(root, text="2. Input Source")
         lf2.pack(fill=tk.X, padx=10, pady=6)
 
-        f_radio = ttk.Frame(lf2); f_radio.pack(fill=tk.X, padx=5, pady=4)
-        ttk.Radiobutton(f_radio, text="Folder (contains images)",
-                        variable=self.mpcp_mode, value="single",
-                        command=self._mpcp_on_mode).pack(side=tk.LEFT, padx=8)
-        ttk.Radiobutton(f_radio, text="Select specific image files",
-                        variable=self.mpcp_mode, value="files",
-                        command=self._mpcp_on_mode).pack(side=tk.LEFT, padx=8)
-
-        # Folder sub-row
-        self._mpcp_frame_folder = ttk.Frame(lf2)
-        self._mpcp_frame_folder.pack(fill=tk.X, padx=5, pady=2)
-
-        ttk.Checkbutton(self._mpcp_frame_folder,
-                        text="Batch mode (parent folder containing multiple scan sub-folders)",
-                        variable=self.mpcp_batch).pack(side=tk.LEFT, padx=4)
-
         f_frow = ttk.Frame(lf2); f_frow.pack(fill=tk.X, padx=5, pady=4)
         ttk.Button(f_frow, text="Select Folder",
                    command=lambda: self.sel_dir(self.mpcp_input_path)).pack(side=tk.LEFT)
         ttk.Entry(f_frow, textvariable=self.mpcp_input_path).pack(
             side=tk.LEFT, fill=tk.X, expand=True, padx=5)
 
-        # File-list sub-row (hidden by default)
-        self._mpcp_frame_files = ttk.Frame(lf2)
-        f_files_row = ttk.Frame(self._mpcp_frame_files)
-        f_files_row.pack(fill=tk.X, padx=5, pady=2)
-        ttk.Button(f_files_row, text="Select Image Files",
-                   command=self._mpcp_sel_files).pack(side=tk.LEFT)
-        self._mpcp_lbl_files = ttk.Label(f_files_row, text="No files selected")
-        self._mpcp_lbl_files.pack(side=tk.LEFT, padx=8)
+        ttk.Checkbutton(lf2,
+                        text="Batch mode (parent folder containing multiple scan sub-folders)",
+                        variable=self.mpcp_batch).pack(anchor=tk.W, padx=9, pady=(2, 6))
 
         # ── 3. Pattern-Set Count ─────────────────────────────────────────
         MAX_SETS = 11
@@ -442,25 +418,6 @@ class ScannerGUI:
         self.txt_log_mpcp.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
 
     # -- helpers for multiPCP tab --
-    def _mpcp_on_mode(self):
-        if self.mpcp_mode.get() == "files":
-            self._mpcp_frame_folder.pack_forget()
-            self._mpcp_frame_files.pack(fill=tk.X, padx=5, pady=2)
-        else:
-            self._mpcp_frame_files.pack_forget()
-            self._mpcp_frame_folder.pack(fill=tk.X, padx=5, pady=2)
-
-    def _mpcp_sel_files(self):
-        files = filedialog.askopenfilenames(
-            title="Select structured-light images (sorted order)",
-            filetypes=[("Image files", "*.png *.bmp"), ("All", "*.*")]
-        )
-        if files:
-            self.mpcp_selected_files = sorted(list(files))
-            self._mpcp_lbl_files.config(
-                text=f"{len(self.mpcp_selected_files)} file(s) selected")
-            self.mpcp_log(f"Selected {len(self.mpcp_selected_files)} files.")
-
     def _mpcp_clamp(self, var, lo, hi):
         try:  v = int(var.get())
         except ValueError: v = lo
@@ -602,34 +559,38 @@ class ScannerGUI:
 
         f_radio = ttk.Frame(lf_mode); f_radio.pack(fill=tk.X, padx=5, pady=5)
         ttk.Radiobutton(f_radio, text="Single File  (one .ply in → one .ply out)",
-                        variable=self.proc_mode, value="file").pack(side=tk.LEFT, padx=10)
+                        variable=self.proc_mode, value="file",
+                        command=self._update_proc_mode_ui).pack(side=tk.LEFT, padx=10)
         ttk.Radiobutton(f_radio, text="Folder Batch (all .ply in folder → output folder)",
-                        variable=self.proc_mode, value="folder").pack(side=tk.LEFT, padx=10)
+                        variable=self.proc_mode, value="folder",
+                        command=self._update_proc_mode_ui).pack(side=tk.LEFT, padx=10)
+
+        # Container for conditional in/out selection
+        self.f_inout_container = ttk.Frame(root)
+        self.f_inout_container.pack(fill=tk.X, pady=2)
 
         # ── Single-file rows ─────────────────────────────────────────────────────
-        lf_single = ttk.LabelFrame(root, text="Single File")
-        lf_single.pack(fill=tk.X, padx=10, pady=2)
+        self.lf_single = ttk.LabelFrame(self.f_inout_container, text="Single File")
 
-        f_sf_in = ttk.Frame(lf_single); f_sf_in.pack(fill=tk.X, padx=5, pady=4)
+        f_sf_in = ttk.Frame(self.lf_single); f_sf_in.pack(fill=tk.X, padx=5, pady=4)
         ttk.Button(f_sf_in, text="Select Input .PLY",
                    command=lambda: self.sel_file_load(self.proc_input_file, "PLY")).pack(side=tk.LEFT)
         ttk.Entry(f_sf_in, textvariable=self.proc_input_file).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
 
-        f_sf_out = ttk.Frame(lf_single); f_sf_out.pack(fill=tk.X, padx=5, pady=4)
+        f_sf_out = ttk.Frame(self.lf_single); f_sf_out.pack(fill=tk.X, padx=5, pady=4)
         ttk.Button(f_sf_out, text="Select Output .PLY",
                    command=lambda: self.sel_file_save(self.proc_output_file, "PLY")).pack(side=tk.LEFT)
         ttk.Entry(f_sf_out, textvariable=self.proc_output_file).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
 
         # ── Folder-batch rows ────────────────────────────────────────────────────
-        lf_batch = ttk.LabelFrame(root, text="Folder Batch")
-        lf_batch.pack(fill=tk.X, padx=10, pady=2)
+        self.lf_batch = ttk.LabelFrame(self.f_inout_container, text="Folder Batch")
 
-        f_in = ttk.Frame(lf_batch); f_in.pack(fill=tk.X, padx=5, pady=4)
+        f_in = ttk.Frame(self.lf_batch); f_in.pack(fill=tk.X, padx=5, pady=4)
         ttk.Button(f_in, text="Select Input Folder",
                    command=lambda: self.sel_dir(self.proc_input_dir)).pack(side=tk.LEFT)
         ttk.Entry(f_in, textvariable=self.proc_input_dir).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
 
-        f_out = ttk.Frame(lf_batch); f_out.pack(fill=tk.X, padx=5, pady=4)
+        f_out = ttk.Frame(self.lf_batch); f_out.pack(fill=tk.X, padx=5, pady=4)
         ttk.Button(f_out, text="Select Output Folder",
                    command=lambda: self.sel_dir(self.proc_output_dir)).pack(side=tk.LEFT)
         ttk.Entry(f_out, textvariable=self.proc_output_dir).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
@@ -716,7 +677,21 @@ class ScannerGUI:
 
         # Button to start Batch processing all at once
         ttk.Button(root, text="Run Processing Pipeline", command=self.do_batch_processing).pack(fill=tk.X, padx=20, pady=20)
-    
+
+        # Initialise UI state based on mode
+        self._update_proc_mode_ui()
+
+    def _update_proc_mode_ui(self):
+        # Unpack both frames
+        self.lf_single.pack_forget()
+        self.lf_batch.pack_forget()
+
+        # Pack the correct one based on mode
+        if self.proc_mode.get() == "file":
+            self.lf_single.pack(fill=tk.X, padx=10, pady=2)
+        else:
+            self.lf_batch.pack(fill=tk.X, padx=10, pady=2)
+
     def setup_merge_tab(self):
         # Tab 3: Align models then merge into one single form
         main_frame = self.tab_merge
@@ -2737,13 +2712,10 @@ class ScannerGUI:
 
     def do_multi_pcp(self):
         calib  = self.mpcp_calib_file.get().strip()
-        mode   = self.mpcp_mode.get()       # 'single' | 'batch' | 'files'
         is_bat = self.mpcp_batch.get()
 
         # Determine effective folder mode
-        folder_mode = "batch" if (mode == "single" and is_bat) else mode
-        if mode == "single" and not is_bat:
-            folder_mode = "single"
+        folder_mode = "batch" if is_bat else "single"
 
         # Validate calibration
         if not calib:
@@ -2786,19 +2758,13 @@ class ScannerGUI:
                 return
 
         # Validate input source
-        if mode == "files":
-            if not self.mpcp_selected_files:
-                messagebox.showerror("Error", "Please select image files first.")
-                return
-            target = ""  # not used in file-list mode
-        else:
-            target = self.mpcp_input_path.get().strip()
-            if not target:
-                messagebox.showerror("Error", "Please select an input folder.")
-                return
-            if not os.path.isdir(target):
-                messagebox.showerror("Error", "Input folder not found.")
-                return
+        target = self.mpcp_input_path.get().strip()
+        if not target:
+            messagebox.showerror("Error", "Please select an input folder.")
+            return
+        if not os.path.isdir(target):
+            messagebox.showerror("Error", "Input folder not found.")
+            return
 
         self.btn_run_mpcp.config(state="disabled")
 
@@ -2817,37 +2783,12 @@ class ScannerGUI:
             try:
                 if stop.is_set():
                     return
-                if mode == "files":
-                    out_path_holder = [None]
-                    save_ev = threading.Event()
-                    def _ask_save():
-                        p = filedialog.asksaveasfilename(
-                            title="Save PLY as", defaultextension=".ply",
-                            filetypes=[("PLY files", "*.ply")])
-                        out_path_holder[0] = p
-                        save_ev.set()
-                    self.root.after(0, _ask_save)
-                    save_ev.wait(timeout=120)
-                    out_path = out_path_holder[0]
-                    if not out_path:
-                        combined_log("Save cancelled.")
-                        self._close_progress_popup(popup)
-                        return
-                    self.processor.process_multi_ply(
-                        calib, "", "files",
-                        log_callback=combined_log,
-                        n_sets_col=n_col, n_sets_row=n_row,
-                        row_mode=row_mode, epipolar_tol=ep_tol,
-                        thresh_mode=thresh_mode, shadow_val=s_val, contrast_val=c_val,
-                        file_list=self.mpcp_selected_files,
-                        out_path_override=out_path)
-                else:
-                    self.processor.process_multi_ply(
-                        calib, target, folder_mode,
-                        log_callback=combined_log,
-                        n_sets_col=n_col, n_sets_row=n_row,
-                        row_mode=row_mode, epipolar_tol=ep_tol,
-                        thresh_mode=thresh_mode, shadow_val=s_val, contrast_val=c_val)
+                self.processor.process_multi_ply(
+                    calib, target, folder_mode,
+                    log_callback=combined_log,
+                    n_sets_col=n_col, n_sets_row=n_row,
+                    row_mode=row_mode, epipolar_tol=ep_tol,
+                    thresh_mode=thresh_mode, shadow_val=s_val, contrast_val=c_val)
 
                 combined_log("Processing complete!")
                 self._close_progress_popup(popup, success=True, message="Point cloud generation complete!")
