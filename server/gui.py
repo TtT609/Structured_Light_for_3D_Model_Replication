@@ -211,6 +211,18 @@ class ScannerGUI:
         self.fix_slice_thick = tk.DoubleVar(value=3.0)
         self.fix_show_picker = tk.BooleanVar(value=False)
 
+        # --- State Variables (Base Remove - Tab 11) ---
+        self.rb_input_file    = tk.StringVar()          # Input .ply or .stl path
+        self.rb_output_file   = tk.StringVar()          # Output path (auto _rmvBase)
+        self.rb_height_offset = tk.DoubleVar(value=0.0) # Signed offset along plane normal (mm)
+        self.rb_flip_side     = tk.BooleanVar(value=False) # True = remove the opposite side
+        self._rb_picked_pts   = []     # 3 [x,y,z] points picked on the base
+        self._rb_plane_normal = None   # Fitted plane normal (numpy array)
+        self._rb_plane_d      = None   # Fitted plane offset scalar
+        self._rb_cloud_pts    = None   # Loaded point array (numpy Nx3)
+        self._rb_cloud_colors = None   # Loaded colors (numpy Nx3) or None
+        self._rb_preview_win  = None   # Reference to open preview Toplevel
+
         # --- Camera Mode (Web Frontend vs Android Native) ---
         self.camera_mode = tk.StringVar(value="web")  # 'web' or 'android'
 
@@ -228,7 +240,8 @@ class ScannerGUI:
         self.tab_calib_check = ttk.Frame(self.notebook)
         self.tab_ply_inspect = ttk.Frame(self.notebook)
         self.tab_manual_merge = ttk.Frame(self.notebook)
-        self.tab_fix = ttk.Frame(self.notebook)
+        self.tab_fix         = ttk.Frame(self.notebook)
+        self.tab_base_remove = ttk.Frame(self.notebook)
 
         # Add frames to the menu
         self.notebook.add(self.tab_scan,         text="1. Scan & Generate")
@@ -241,6 +254,7 @@ class ScannerGUI:
         self.notebook.add(self.tab_ply_inspect,  text="8. PLY Inspector")
         self.notebook.add(self.tab_manual_merge, text="9. Manual Merge")
         self.notebook.add(self.tab_fix,          text="10. Fix")
+        self.notebook.add(self.tab_base_remove,  text="11. Base Remove")
 
         # Initialize UI components for each tab
         self.setup_scan_tab()
@@ -253,6 +267,7 @@ class ScannerGUI:
         self.setup_ply_inspect_tab()
         self.setup_manual_merge_tab()
         self.setup_fix_tab()
+        self.setup_base_remove_tab()
 
     # ==========================================
     # GUI Layout Functions for Each Tab
@@ -3719,3 +3734,494 @@ class ScannerGUI:
                 self._close_progress_popup(popup, success=False, message=str(e))
 
         threading.Thread(target=run, daemon=True).start()
+
+
+    # ==========================================
+    # Tab 11: Base Remove
+    # ==========================================
+
+    def setup_base_remove_tab(self):
+        """Tab 11: Remove the base of a point cloud using RANSAC plane fitting."""
+        main_frame = self.tab_base_remove
+
+        canvas  = tk.Canvas(main_frame, highlightthickness=0)
+        scrollb = ttk.Scrollbar(main_frame, orient="vertical", command=canvas.yview)
+        root    = ttk.Frame(canvas)
+        root.bind("<Configure>",
+                  lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        fid = canvas.create_window((0, 0), window=root, anchor="nw")
+        canvas.bind("<Configure>", lambda e: canvas.itemconfig(fid, width=e.width))
+        canvas.configure(yscrollcommand=scrollb.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollb.pack(side="right", fill="y")
+
+        def _mwheel(ev):
+            try:
+                if self.notebook.select() == str(self.tab_base_remove):
+                    canvas.yview_scroll(int(-1 * (ev.delta / 120)), "units")
+            except Exception:
+                pass
+        canvas.bind_all("<MouseWheel>", _mwheel, add="+")
+
+        # Header
+        ttk.Label(root, text="Base Remove",
+                  font=("Arial", 14, "bold")).pack(pady=10)
+
+        desc = (
+            "Remove the flat base/platform from a scanned object (point cloud).\n"
+            "Step 1: Select a .ply point cloud file.\n"
+            "Step 2: Click START \u2014 Shift+Click 3 points on the base in the Open3D window.\n"
+            "Step 3: Adjust height, preview, switch side if needed, then Finish."
+        )
+        ttk.Label(root, text=desc, justify=tk.CENTER,
+                  foreground="#333", font=("Arial", 9, "italic")).pack(pady=(0, 8))
+
+        # 1. Input File
+        lf_in = ttk.LabelFrame(root, text="1. Input File  (.ply point cloud)")
+        lf_in.pack(fill=tk.X, padx=10, pady=5)
+
+        f_in = ttk.Frame(lf_in); f_in.pack(fill=tk.X, padx=5, pady=6)
+        ttk.Button(f_in, text="Browse .ply",
+                   command=self._rb_sel_input).pack(side=tk.LEFT)
+        ttk.Entry(f_in, textvariable=self.rb_input_file).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+
+        # 2. Output Path
+        lf_out = ttk.LabelFrame(root, text="2. Output Path  (auto-filled with _rmvBase suffix)")
+        lf_out.pack(fill=tk.X, padx=10, pady=5)
+
+        f_out = ttk.Frame(lf_out); f_out.pack(fill=tk.X, padx=5, pady=6)
+        ttk.Button(f_out, text="Browse Save Path",
+                   command=lambda: self._rb_browse_output()).pack(side=tk.LEFT)
+        ttk.Entry(f_out, textvariable=self.rb_output_file).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+
+        # 3. Start
+        ttk.Button(root,
+                   text="\u25b6  START \u2014 Pick Base Points",
+                   command=self._rb_start).pack(fill=tk.X, padx=20, pady=14)
+
+        # 4. Status
+        lf_status = ttk.LabelFrame(root, text="Status")
+        lf_status.pack(fill=tk.X, padx=10, pady=5)
+
+        self._rb_status_var = tk.StringVar(value="Ready. Select an input file and click START.")
+        ttk.Label(lf_status, textvariable=self._rb_status_var,
+                  foreground="#0066CC", font=("Arial", 9),
+                  wraplength=680, justify=tk.LEFT).pack(padx=8, pady=6)
+
+    # Input / output helpers
+
+    def _rb_sel_input(self):
+        """Browse for input .ply point cloud and auto-fill output path."""
+        f = filedialog.askopenfilename(
+            title="Select Input Point Cloud (.ply)",
+            filetypes=[("PLY Point Cloud", "*.ply")])
+        if not f:
+            return
+        self.rb_input_file.set(f)
+        base, ext = os.path.splitext(f)
+        self.rb_output_file.set(base + "_rmvBase" + ext)
+
+    def _rb_browse_output(self):
+        """Browse for output .ply save path."""
+        f = filedialog.asksaveasfilename(
+            title="Save Output Point Cloud As",
+            filetypes=[("PLY Point Cloud", "*.ply")],
+            defaultextension=".ply")
+        if f:
+            self.rb_output_file.set(f)
+
+    # Main workflow
+
+    def _rb_start(self):
+        """Validate inputs then open the Open3D point picker in a background thread."""
+        in_f  = self.rb_input_file.get().strip()
+        out_f = self.rb_output_file.get().strip()
+
+        if not in_f:
+            messagebox.showerror("No Input", "Please select an input file first.")
+            return
+        if not os.path.isfile(in_f):
+            messagebox.showerror("File Not Found", f"Cannot find:\n{in_f}")
+            return
+        if not out_f:
+            messagebox.showerror("No Output", "Please set an output path.")
+            return
+
+        self._rb_picked_pts   = []
+        self._rb_plane_normal = None
+        self._rb_plane_d      = None
+        self._rb_cloud_pts    = None
+        self._rb_cloud_colors = None
+
+        self._rb_status_var.set(
+            "Opening 3D picker \u2014 Shift+Click 3 points on the BASE, then close the window\u2026")
+        self.root.update_idletasks()
+        threading.Thread(target=self._rb_pick_thread, args=(in_f,), daemon=True).start()
+
+    # Point Picker (Open3D - same as Fix tab)
+
+    def _rb_pick_thread(self, in_f):
+        """Background thread: load cloud, open Open3D VisualizerWithEditing,
+        let user Shift+Click 3 points, then continue to RANSAC + preview."""
+        try:
+            import open3d as o3d
+
+            self.root.after(0, lambda: self._rb_status_var.set("Loading point cloud\u2026"))
+            pcd = o3d.io.read_point_cloud(in_f)
+            pts = np.asarray(pcd.points)
+            if len(pts) == 0:
+                self.root.after(0, lambda: messagebox.showerror(
+                    "Empty File", "The .ply file contains no points."))
+                self.root.after(0, lambda: self._rb_status_var.set("Error: empty file."))
+                return
+
+            if not pcd.has_colors():
+                pcd.paint_uniform_color([0.65, 0.65, 0.65])
+
+            self._rb_cloud_pts    = pts
+            self._rb_cloud_colors = np.asarray(pcd.colors)
+
+            self.root.after(0, lambda: self._rb_status_var.set(
+                f"File loaded ({len(pts):,} pts).  "
+                f"3D window opening \u2014 Shift+Click 3 points on the BASE, then close the window."))
+
+            vis = o3d.visualization.VisualizerWithEditing()
+            vis.create_window(
+                window_name="Base Remove \u2014 Shift+Click 3 points on the BASE surface, then close this window",
+                width=1200, height=800)
+            vis.add_geometry(pcd)
+
+            opt = vis.get_render_option()
+            opt.point_size = 3.0
+            opt.background_color = [0.12, 0.12, 0.15]
+
+            vis.run()
+            vis.destroy_window()
+
+            picked_idx = vis.get_picked_points()
+
+            if len(picked_idx) < 3:
+                self.root.after(0, lambda: messagebox.showwarning(
+                    "Not Enough Points",
+                    f"You picked {len(picked_idx)} point(s) but need exactly 3.\n\n"
+                    "Shift+Click 3 points on the flat base surface, then close the window.\n"
+                    "Click START again to retry."))
+                self.root.after(0, lambda: self._rb_status_var.set(
+                    f"\u274c Only {len(picked_idx)} point(s) picked \u2014 need 3. Click START to retry."))
+                return
+
+            selected = pts[list(picked_idx[:3])]
+            self._rb_picked_pts = selected.tolist()
+
+            def fmt(p):
+                return f"({p[0]:.1f}, {p[1]:.1f}, {p[2]:.1f})"
+            self.root.after(0, lambda: self._rb_status_var.set(
+                f"\u2713 3 points picked: "
+                f"{fmt(self._rb_picked_pts[0])}  "
+                f"{fmt(self._rb_picked_pts[1])}  "
+                f"{fmt(self._rb_picked_pts[2])}  \u2014 Running RANSAC\u2026"))
+
+            self._rb_fit_and_preview()
+
+        except Exception as ex:
+            import traceback
+            err = traceback.format_exc()
+            self.root.after(0, lambda: messagebox.showerror("Picker Error", f"{ex}\n\n{err}"))
+            self.root.after(0, lambda: self._rb_status_var.set(f"Error: {ex}"))
+
+    # RANSAC + Preview
+
+    def _rb_fit_and_preview(self):
+        """Run RANSAC plane fit then open the preview window (called in thread)."""
+        try:
+            pts      = self._rb_cloud_pts
+            seed_pts = np.array(self._rb_picked_pts)
+            normal, d = self._rb_ransac_plane(pts, seed_pts)
+            self._rb_plane_normal = normal
+            self._rb_plane_d      = d
+            self.root.after(0, lambda: self._rb_status_var.set(
+                f"Plane fitted  normal=({normal[0]:.3f}, {normal[1]:.3f}, {normal[2]:.3f})  d={d:.2f}"))
+            self.root.after(0, self._rb_open_preview_window)
+        except Exception as ex:
+            import traceback
+            err = traceback.format_exc()
+            self.root.after(0, lambda: messagebox.showerror("Fit Error", f"{ex}\n\n{err}"))
+            self.root.after(0, lambda: self._rb_status_var.set(f"RANSAC error: {ex}"))
+
+    @staticmethod
+    def _rb_ransac_plane(pts, seed_pts, n_iter=3000, thresh=2.0):
+        """RANSAC plane fitting seeded from 3 picked points.
+        Returns (unit_normal, d) for plane equation: normal dot x = d
+        """
+        best_normal, best_d, best_count = None, None, -1
+
+        p1, p2, p3 = seed_pts[0], seed_pts[1], seed_pts[2]
+        n = np.cross(p2 - p1, p3 - p1)
+        if np.linalg.norm(n) > 1e-9:
+            n /= np.linalg.norm(n)
+            d = float(np.dot(n, p1))
+            cnt = int(np.sum(np.abs(pts @ n - d) < thresh))
+            best_normal, best_d, best_count = n.copy(), d, cnt
+
+        rng = np.random.default_rng(42)
+        for _ in range(n_iter):
+            idx = rng.choice(len(pts), 3, replace=False)
+            p1, p2, p3 = pts[idx[0]], pts[idx[1]], pts[idx[2]]
+            n = np.cross(p2 - p1, p3 - p1)
+            nlen = np.linalg.norm(n)
+            if nlen < 1e-9:
+                continue
+            n = n / nlen
+            d = float(np.dot(n, p1))
+            dists = np.abs(pts @ n - d)
+            cnt = int(np.sum(dists < thresh))
+            if cnt > best_count:
+                best_normal, best_d, best_count = n.copy(), d, cnt
+
+        if best_normal is None:
+            raise ValueError("RANSAC failed to find a valid plane. Try picking different points.")
+        return best_normal, best_d
+
+    # Preview Window (Tkinter controls + Open3D viewer)
+
+    def _rb_open_preview_window(self):
+        """Open a Tkinter control panel. 3D view is shown via Open3D (same as the picker window)."""
+        normal = self._rb_plane_normal
+        d_base = self._rb_plane_d
+
+        if self._rb_preview_win is not None:
+            try:
+                self._rb_preview_win.destroy()
+            except Exception:
+                pass
+
+        win = tk.Toplevel(self.root)
+        win.title("Base Remove \u2014 Adjust & Preview")
+        win.geometry("440x580")
+        win.resizable(False, False)
+        self._rb_preview_win = win
+
+        ttk.Label(win, text="Base Remove \u2014 Adjust Cut",
+                  font=("Arial", 13, "bold")).pack(pady=(14, 4))
+
+        n = normal
+        lf_plane = ttk.LabelFrame(win, text="Fitted Plane")
+        lf_plane.pack(fill=tk.X, padx=14, pady=4)
+        ttk.Label(lf_plane,
+                  text=f"Normal:  ({n[0]:.4f},  {n[1]:.4f},  {n[2]:.4f})\n"
+                       f"Offset d: {d_base:.3f}",
+                  font=("Consolas", 9), foreground="#0055AA",
+                  justify=tk.LEFT).pack(padx=8, pady=4)
+
+        ttk.Separator(win, orient="horizontal").pack(fill=tk.X, padx=14, pady=6)
+
+        lf_h = ttk.LabelFrame(win, text="Height Offset along Plane Normal")
+        lf_h.pack(fill=tk.X, padx=14, pady=4)
+
+        ttk.Label(lf_h,
+                  text="Positive \u2192 move cut into object (keep less base)\n"
+                       "Negative \u2192 move cut back (keep more base)",
+                  foreground="#555", font=("Arial", 8), justify=tk.LEFT).pack(padx=6, pady=(4, 2))
+
+        f_spin = ttk.Frame(lf_h); f_spin.pack(fill=tk.X, padx=6, pady=4)
+        ttk.Label(f_spin, text="Offset (mm):").pack(side=tk.LEFT)
+        ttk.Spinbox(f_spin, textvariable=self.rb_height_offset,
+                    from_=-500.0, to=500.0, increment=0.5,
+                    width=10, justify="center").pack(side=tk.LEFT, padx=6)
+
+        tk.Scale(lf_h, variable=self.rb_height_offset,
+                 from_=-200.0, to=200.0, resolution=0.5,
+                 orient=tk.HORIZONTAL, length=360,
+                 troughcolor="#2c3e50", activebackground="#3498db",
+                 bg="#f0f0f0", highlightthickness=0).pack(padx=6, pady=(0, 6))
+
+        ttk.Separator(win, orient="horizontal").pack(fill=tk.X, padx=14, pady=6)
+
+        side_lbl = tk.StringVar(value="Removing: BELOW plane (base)")
+
+        def _switch_side():
+            self.rb_flip_side.set(not self.rb_flip_side.get())
+            side_lbl.set("Removing: ABOVE plane"
+                         if self.rb_flip_side.get() else "Removing: BELOW plane (base)")
+
+        ttk.Button(win, text="\u21c5  Switch Side  (if wrong part turns red)",
+                   command=_switch_side).pack(fill=tk.X, padx=14, pady=4)
+        ttk.Label(win, textvariable=side_lbl,
+                  foreground="#e67e22", font=("Arial", 9, "bold")).pack(pady=(0, 4))
+
+        ttk.Separator(win, orient="horizontal").pack(fill=tk.X, padx=14, pady=6)
+
+        lf_prev = ttk.LabelFrame(win, text="3D Preview  (same Open3D viewer as point picker)")
+        lf_prev.pack(fill=tk.X, padx=14, pady=4)
+
+        ttk.Label(lf_prev,
+                  text="Red = will be REMOVED     Grey/colour = KEPT\n"
+                       "Close the 3D window to come back here and adjust.",
+                  foreground="#555", font=("Arial", 8), justify=tk.LEFT).pack(padx=6, pady=(4, 2))
+
+        def _open_o3d_preview():
+            # Prevent multiple preview windows
+            if getattr(self, '_rb_is_previewing', False):
+                return
+            self._rb_is_previewing = True
+
+            def _run():
+                try:
+                    import open3d as o3d
+                    import time
+                    pts    = self._rb_cloud_pts
+                    c_orig = self._rb_cloud_colors
+
+                    pcd_view = o3d.geometry.PointCloud()
+                    pcd_view.points = o3d.utility.Vector3dVector(pts)
+                    
+                    last_offset = None
+                    last_flip = None
+
+                    vis = o3d.visualization.Visualizer()
+                    vis.create_window(
+                        window_name="Live Preview  |  RED=REMOVED  |  Adjust controls in the other window",
+                        width=1200, height=800)
+                    vis.add_geometry(pcd_view)
+                    opt = vis.get_render_option()
+                    opt.point_size = 2.5
+                    opt.background_color = [0.12, 0.12, 0.15]
+
+                    while True:
+                        if not vis.poll_events():
+                            break
+                        
+                        current_offset = self.rb_height_offset.get()
+                        current_flip = self.rb_flip_side.get()
+
+                        if current_offset != last_offset or current_flip != last_flip:
+                            last_offset = current_offset
+                            last_flip = current_flip
+                            
+                            cut_d  = d_base + current_offset
+                            signed = pts @ normal - cut_d
+                            remove_mask = signed < 0
+                            if current_flip:
+                                remove_mask = ~remove_mask
+                            keep_mask = ~remove_mask
+
+                            c = np.zeros((len(pts), 3))
+                            if c_orig is not None:
+                                c[keep_mask] = c_orig[keep_mask]
+                            else:
+                                c[keep_mask] = [0.65, 0.65, 0.65]
+                            c[remove_mask] = [0.92, 0.10, 0.10]
+
+                            pcd_view.colors = o3d.utility.Vector3dVector(c)
+                            vis.update_geometry(pcd_view)
+
+                            n_rem = int(remove_mask.sum())
+                            n_kep = int(keep_mask.sum())
+                            
+                            def _update_status(off=current_offset, k=n_kep, r=n_rem):
+                                self._rb_status_var.set(
+                                    f"Preview: offset={off:+.1f} mm  |  Keep {k:,}  Remove {r:,}")
+                                
+                            self.root.after(0, _update_status)
+
+                        vis.update_renderer()
+                        time.sleep(0.05)
+
+                    vis.destroy_window()
+
+                except Exception as ex:
+                    import traceback
+                    err = traceback.format_exc()
+                    self.root.after(0, lambda: messagebox.showerror("Preview Error",
+                                                                     f"{ex}\n\n{err}"))
+                finally:
+                    self._rb_is_previewing = False
+
+            threading.Thread(target=_run, daemon=True).start()
+
+        tk.Button(lf_prev, text="\U0001f50d  Preview in 3D",
+                  command=_open_o3d_preview,
+                  bg="#2980b9", fg="white", font=("Arial", 10, "bold"),
+                  padx=8, pady=6, cursor="hand2", relief="raised").pack(
+                      fill=tk.X, padx=8, pady=(4, 8))
+
+        ttk.Separator(win, orient="horizontal").pack(fill=tk.X, padx=14, pady=6)
+
+        btn_row = ttk.Frame(win); btn_row.pack(fill=tk.X, padx=14, pady=4)
+
+        def _reselect():
+            win.destroy()
+            threading.Thread(target=self._rb_pick_thread,
+                             args=(self.rb_input_file.get().strip(),),
+                             daemon=True).start()
+
+        ttk.Button(btn_row, text="\u21ba  Re-select Points",
+                   command=_reselect).pack(side=tk.LEFT, padx=4)
+
+        def _finish():
+            out_f = self.rb_output_file.get().strip()
+            in_f  = self.rb_input_file.get().strip()
+            if not out_f:
+                messagebox.showerror("No Output Path",
+                                     "Please set an output path in the tab first.")
+                return
+            confirm = messagebox.askyesno(
+                "Finish & Export",
+                f"Remove the highlighted region and save to:\n\n{out_f}\n\nContinue?")
+            if not confirm:
+                return
+            win.destroy()
+            self._rb_status_var.set("Exporting\u2026")
+            self.root.update_idletasks()
+            threading.Thread(target=lambda: self._rb_do_export(in_f, out_f),
+                             daemon=True).start()
+
+        tk.Button(btn_row, text="\u2714  Finish & Export",
+                  command=_finish,
+                  bg="#27ae60", fg="white", font=("Arial", 10, "bold"),
+                  padx=8, pady=6, cursor="hand2", relief="raised").pack(
+                      side=tk.RIGHT, padx=4)
+
+        win.protocol("WM_DELETE_WINDOW", win.destroy)
+
+
+    def _rb_do_export(self, in_f, out_f):
+        """Apply the plane cut and save the output .ply point cloud."""
+        try:
+            import open3d as o3d
+
+            normal = self._rb_plane_normal
+            d_val  = self._rb_plane_d
+            offset = self.rb_height_offset.get()
+            flip   = self.rb_flip_side.get()
+
+            cut_d = d_val + offset
+
+            pcd = o3d.io.read_point_cloud(in_f)
+            pts = np.asarray(pcd.points)
+            signed = pts @ normal - cut_d
+            keep_mask = signed >= 0
+            if flip:
+                keep_mask = ~keep_mask
+
+            kept_pcd = pcd.select_by_index(np.where(keep_mask)[0])
+            o3d.io.write_point_cloud(out_f, kept_pcd)
+            n_kept    = int(np.sum(keep_mask))
+            n_removed = int(np.sum(~keep_mask))
+
+            self.root.after(0, lambda: self._rb_status_var.set(
+                f"✔ Done!  Kept {n_kept:,} pts  |  Removed {n_removed:,} pts  |  Saved to {out_f}"))
+            self.root.after(0, lambda: messagebox.showinfo(
+                "Base Remove Complete",
+                f"Base removed successfully!\n\n"
+                f"  Kept:    {n_kept:,} points\n"
+                f"  Removed: {n_removed:,} points\n\n"
+                f"Saved to:\n{out_f}"))
+
+        except Exception as ex:
+            import traceback
+            err = traceback.format_exc()
+            self.root.after(0, lambda: messagebox.showerror("Export Error", f"{ex}\n\n{err}"))
+            self.root.after(0, lambda: self._rb_status_var.set(f"Export error: {ex}"))
